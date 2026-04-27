@@ -182,7 +182,8 @@ def _per_layer_per_block_split_signal(
 
 
 # ---------------------------------------------------------------------------
-# Plotting (uses subfigures so section labels never overlap subplot titles)
+# Plotting (explicit GridSpec with dedicated label rows so labels can never
+# collide with subplot titles below them)
 # ---------------------------------------------------------------------------
 
 def _plot_split_3way(
@@ -209,55 +210,81 @@ def _plot_split_3way(
     finite = np.concatenate(finite) if finite else np.array([0.0, 1.0])
     vmin, vmax = float(finite.min()), float(finite.max())
 
-    fig = plt.figure(figsize=(22, 26))
-    fig.suptitle(title, fontsize=15, y=0.995, fontweight="bold")
+    fig = plt.figure(figsize=(22, 30))
+    fig.suptitle(title, fontsize=15, y=0.99, fontweight="bold")
 
-    subfigs = fig.subfigures(
-        4, 1,
-        height_ratios=[3.0, 3.0, 3.0, 2.5],
-        hspace=0.04,
+    # GridSpec with dedicated *label rows* between sections so titles never overlap.
+    # Rows: [section1_label, hm row, hm row, section2_label, hm row, hm row,
+    #        section3_label, hm row, hm row, summary_label, summary_row]
+    gs = fig.add_gridspec(
+        11, 4,
+        height_ratios=[
+            0.35,        # row 0:  section 1 label
+            2.5, 2.5,    # rows 1-2: recent heatmaps (2 rows × 4 cols = 8 blocks)
+            0.35,        # row 3:  section 2 label
+            2.5, 2.5,    # rows 4-5: distant heatmaps
+            0.35,        # row 6:  section 3 label
+            2.5, 2.5,    # rows 7-8: current heatmaps
+            0.35,        # row 9:  summary label
+            4.0,         # row 10: summary line plots
+        ],
+        hspace=0.65, wspace=0.30,
+        top=0.965,    # leave room for fig.suptitle
+        bottom=0.035,
+        left=0.05,
+        right=0.93,   # leave room for colorbar
     )
 
-    sections = [
-        (subfigs[0], recent_arr,  f"RECENT prefix  [-{recent_window}:]  (last {recent_window} tokens before block start)", "tab:blue"),
-        (subfigs[1], distant_arr, f"DISTANT prefix  [0:-{recent_window}]  (everything earlier)",                            "tab:red"),
-        (subfigs[2], current_arr,  "CURRENT BLOCK  (the 32 mask positions of block k itself — reverse look)",               "tab:green"),
-    ]
+    def _label_row(row_idx: int, text: str, color: str):
+        ax = fig.add_subplot(gs[row_idx, :])
+        ax.text(0.5, 0.5, text, ha="center", va="center",
+                fontsize=14, color=color, fontweight="bold",
+                transform=ax.transAxes)
+        ax.set_axis_off()
 
-    last_im = None
-    for sf, arr, label, color in sections:
-        sf.suptitle(label, fontsize=13, color=color, fontweight="bold", y=0.99)
-        axes = sf.subplots(2, 4)
+    last_im = [None]
+
+    def _draw_heatmaps(start_row: int, arr: np.ndarray):
         for i, b in enumerate(blocks[:8]):
-            ax = axes[i // 4, i % 4]
+            ax = fig.add_subplot(gs[start_row + i // 4, i % 4])
             if not np.all(np.isnan(arr[i])):
-                last_im = ax.imshow(
+                last_im[0] = ax.imshow(
                     arr[i].T, aspect="auto", origin="lower",
                     vmin=vmin, vmax=vmax, cmap="viridis",
                 )
-            ax.set_title(f"block {b}", fontsize=10)
+            ax.set_title(f"block {b}", fontsize=10, pad=4)
             ax.set_xlabel("layer ℓ", fontsize=9)
             ax.set_ylabel("head h", fontsize=9)
-        # Tighten internal spacing
-        sf.subplots_adjust(top=0.86, bottom=0.10, left=0.05, right=0.97, hspace=0.55, wspace=0.30)
 
-    # Shared colorbar at the right of the heatmap rows
-    if last_im is not None:
-        cbar_ax = fig.add_axes([0.985, 0.30, 0.008, 0.55])
-        fig.colorbar(last_im, cax=cbar_ax)
+    # RECENT
+    _label_row(0, f"RECENT prefix  [-{recent_window}:]  (last {recent_window} tokens before block start)", "tab:blue")
+    _draw_heatmaps(1, recent_arr)
+    # DISTANT
+    _label_row(3, f"DISTANT prefix  [0:-{recent_window}]  (everything earlier)", "tab:red")
+    _draw_heatmaps(4, distant_arr)
+    # CURRENT BLOCK
+    _label_row(6, "CURRENT BLOCK  (the 32 mask positions of block k itself — reverse look)", "tab:green")
+    _draw_heatmaps(7, current_arr)
 
-    # Summary subfigure: 3 side-by-side line plots (recent | distant | current_block)
-    sf_summary = subfigs[3]
-    sf_summary.suptitle("Per-layer summary (mean over heads)", fontsize=12, y=0.97)
-    axes_s = sf_summary.subplots(1, 3)
+    # Shared colorbar at the right
+    if last_im[0] is not None:
+        cbar_ax = fig.add_axes([0.945, 0.27, 0.010, 0.62])
+        fig.colorbar(last_im[0], cax=cbar_ax)
+
+    # Summary section
+    _label_row(9, "Per-layer summary (mean over heads)", "black")
+    sub_gs = gs[10, :].subgridspec(1, 3, wspace=0.30)
     cmap = plt.colormaps["tab10"]
 
-    for ax_s, arr, label, color in zip(
-        axes_s,
-        [recent_arr, distant_arr, current_arr],
-        ["RECENT", "DISTANT", "CURRENT BLOCK"],
-        ["tab:blue", "tab:red", "tab:green"],
-    ):
+    summary_arrs = [recent_arr, distant_arr, current_arr]
+    summary_labels = ["RECENT", "DISTANT", "CURRENT BLOCK"]
+    summary_colors = ["tab:blue", "tab:red", "tab:green"]
+
+    for col in range(3):
+        arr = summary_arrs[col]
+        label = summary_labels[col]
+        color = summary_colors[col]
+        ax_s = fig.add_subplot(sub_gs[0, col])
         curves = np.nanmean(arr, axis=-1)  # [num_blocks, L]
         for i, b in enumerate(blocks):
             if np.all(np.isnan(curves[i])):
@@ -268,14 +295,13 @@ def _plot_split_3way(
                       color="black", linewidth=2.5, label="mean")
         ax_s.set_xlabel("layer ℓ")
         ax_s.set_ylabel(y_label)
-        ax_s.set_title(label, fontsize=12, color=color, fontweight="bold")
+        ax_s.set_title(label, fontsize=12, color=color, fontweight="bold", pad=6)
         ax_s.legend(ncol=2, fontsize=8, loc="best")
         ax_s.grid(True, alpha=0.3)
-    sf_summary.subplots_adjust(top=0.85, bottom=0.18, left=0.05, right=0.97, wspace=0.25)
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(out_path, dpi=150, bbox_inches="tight")
-    fig.savefig(out_path.with_suffix(".pdf"), bbox_inches="tight")
+    fig.savefig(out_path, dpi=150)
+    fig.savefig(out_path.with_suffix(".pdf"))
     plt.close(fig)
 
 

@@ -26,6 +26,7 @@ python -m probe_runner.run_probes --model both
 python -m probe_runner.plots.plot_info_flow_to_prefix --model llada
 python -m probe_runner.plots.plot_flow_split_prefix --model llada
 python -m probe_runner.plots.plot_cka --model llada
+python -m probe_runner.plots.plot_logit_lens --model llada    # needs model on GPU; ~5–10 min
 ```
 
 All commands assume the **current directory** is the parent of `probe_runner/`. Output is written to `./probes_out/`.
@@ -87,7 +88,7 @@ probes_out/
 
 ## Plotting
 
-Five plot variants are available, organized into three scripts. They all share the same per-sample filters (EOS cutoff, special-token subtraction) — see "Filters applied to all plots" below.
+Six plot variants are available, organized into four scripts. They all share the same per-sample filters (EOS cutoff, special-token subtraction) — see "Filters applied to all plots" below.
 
 ### 1. Raw attention to prefix — *where* attention points
 
@@ -189,6 +190,35 @@ The plot shows two views:
 
 A red dashed line at CKA = 0.95 marks the conventional saturation threshold.
 
+### 6. Logit lens — *which layers stop changing the predicted distribution*
+
+```bash
+python -m probe_runner.plots.plot_logit_lens --model llada
+python -m probe_runner.plots.plot_logit_lens --model llada --top_k 10
+```
+
+Requires the model loaded on GPU (we need the model's final norm + LM head to project hidden states into vocab space). Runtime ~5–10 min on a 3090. Saves a single figure with **three side-by-side panels**, one per metric:
+
+| Metric | Range | Higher = | Saturation marker |
+|---|---:|---|---|
+| `top_k_overlap` (default K=5) | [0, 1] | layer agrees with final on top-K tokens | red dashed at 0.95 |
+| `kl_divergence`  KL(p_ℓ ‖ p_L) | [0, ∞) | layer disagrees with final | none — interpret near zero |
+| `shared_mass`  Σ min(p_ℓ, p_L) | [0, 1] | layer's distribution overlaps final | red dashed at 0.95 |
+
+For each masked position, we compute `p_ℓ = softmax(lm_head(final_norm(h_masked[ℓ])))` for every layer ℓ, then compare to `p_L`. All three metrics are averaged over masked positions, samples, and blocks.
+
+#### What this tells you that CKA doesn't
+
+CKA tells you when the **representation** stops moving in d_model space (rotation-invariant). Logit-lens tells you when the **output decision** stops moving in vocab space — which is what we ultimately care about for "thinking depth," because the model's job is to produce token distributions, not arbitrary representations.
+
+The layer at which `top_k_overlap` ≥ 0.95 and `shared_mass` ≥ 0.95 (and `kl_divergence` ≈ 0) is the layer at which the model has effectively decided what to emit. Layers above that may still rotate or rescale the representation (which CKA would notice), but they no longer change *which tokens get probability mass*. That's a sharper prune signal than CKA: a saturated logit lens directly shows that subsequent layers are not reshaping the output distribution.
+
+CKA and logit-lens should agree under most conditions. If they disagree (e.g., CKA saturates at layer 26 but logit-lens not until layer 30), the gap is informative: those 4 layers are doing distribution-shaping work that doesn't show up as representation drift, so they shouldn't be pruned.
+
+The `--top_k` flag controls the K used in `top_k_overlap` only (default 5). Other metrics are unaffected.
+
+**Caveat:** all three metrics are always computed and plotted together — there's currently no flag to select a single metric. If you only care about one (e.g., shared_mass), the entire figure still gets produced. Cost is a single full-model forward over all (sample, block, layer) combinations regardless.
+
 ### Filters applied to all plots
 
 All plot scripts apply two per-sample filters by default:
@@ -220,7 +250,8 @@ probe_runner/
     ├── __init__.py
     ├── plot_info_flow_to_prefix.py       attn / flow / flow_normalized — single-partition prefix
     ├── plot_flow_split_prefix.py         3-way split (recent / distant / current_block) for any variant
-    └── plot_cka.py                       CKA(h_ℓ, h_L) per-block + pooled
+    ├── plot_cka.py                       CKA(h_ℓ, h_L) per-block + pooled
+    └── plot_logit_lens.py                top-K overlap, KL, shared-mass vs final layer (needs model on GPU)
 ```
 
 The cloned external code lives outside this directory:
@@ -265,6 +296,15 @@ python -m probe_runner.plots.plot_flow_split_prefix --model {llada,dream}
 ```
 python -m probe_runner.plots.plot_cka --model {llada,dream}
                                        [--probes_root probes_out]
+```
+
+```
+python -m probe_runner.plots.plot_logit_lens --model {llada,dream}
+                                              [--probes_root probes_out]
+                                              [--top_k 5]
+                                              [--fast_dllm_path /path/to/Fast-dLLM/v1]
+                                              [--no_eos_cutoff]
+                                              [--no_special_filter]
 ```
 
 ---
@@ -318,6 +358,7 @@ If disk is tight: set `v_norm_blocks = [0]` (~5% saving) or `record_blocks = [0,
 ## Known caveats
 
 - **Eager / manual-softmax attention required.** SDPA/flash do not expose attention weights. The patched attention runs manual softmax during the probe-hooked forwards. Roughly halves throughput vs flash, but it only matters during the 100-sample probe run, not during downstream T3 training.
+- **Logit-lens needs the model loaded.** Unlike the other plots, `plot_logit_lens.py` re-loads the full model (LLaDA-8B or Dream-7B) so it can project hidden states through the LM head. Needs ≥16 GB GPU memory; cost is ~5–10 min on a 3090. The other plots run from H5 files alone in a couple of minutes.
 - **Single sample per batch.** The hooks assume `B=1`. Batching is possible but adds index-juggling; not implemented.
 - **Dream's KV-cache format.** Fast-dLLM v1's local `model/modeling_dream.py` provides the `dual_cache + replace_position` interface. If Fast-dLLM upstream changes that interface, `dream_runner.py` may need a small alignment patch — see `T3_pruning_probe_step1to4.md` §10 for the failure-mode table.
 - **Attention-sink subtraction is heuristic.** Default `attention_sink_positions=[0]`. If sample-0 sanity shows `mean_attn_to_pos0 < 0.1`, the heuristic is wrong; manually edit `meta.json` to update the sink list before plotting.
@@ -327,16 +368,17 @@ For the full failure-mode table and acceptance criteria, see `T3_pruning_probe_s
 
 ---
 
-## How the five plots fit together for the prune decision
+## How the six plots fit together for the prune decision
 
 Reading order when interpreting a fresh probe run:
 
-1. **CKA** first — gives the cleanest single-number prune candidate (the layer at which CKA-to-final crosses 0.95). Look at both per-block and pooled curves; if they agree, you have a strong prune-tail signal.
-2. **Normalized flow** (single-partition) — sanity check. The CKA-knee should roughly coincide with where the prefix flow ratio stops changing meaningfully.
-3. **Split normalized flow** — diagnostic. *Why* did the flow ratio change at that layer? Did recent prefix grow (local-context shift) or current block grow (intra-block reasoning) or did it just plateau (saturation)? Different patterns suggest different prune strategies.
-4. **Raw attn / flow** — for sanity check only. These are dominated by sink mass and depth-induced norm growth respectively, so don't drive the prune decision off them — but if the CKA knee disagrees with what raw attention says, that disagreement is itself worth investigating.
+1. **Logit lens** — the most direct prune signal. The layer at which `top_k_overlap` ≥ 0.95 and `shared_mass` ≥ 0.95 is the layer at which the model has effectively decided which tokens to emit. Strong prune candidate from this layer onward.
+2. **CKA** — sanity check on (1). Should saturate at roughly the same layer as logit-lens. If CKA saturates earlier, those layers are merely rotating the representation (CKA-invariant), so don't trust CKA alone as prune cut. If CKA saturates later, those late layers are reshaping the representation in ways logit-lens shows are not changing the output — also prunable. Disagreements are diagnostic.
+3. **Normalized flow** (single-partition) — checks that the prefix-flow ratio also stops changing where logit-lens / CKA saturate. If yes, the model is no longer pulling new information from prefix at that depth.
+4. **Split normalized flow** — diagnostic. *Why* did flow change at the saturation layer? Did recent prefix grow (local-context shift), did current block grow (intra-block reasoning), or did it plateau (saturation)? Different patterns suggest different prune strategies.
+5. **Raw attn / flow** — sanity check only. These are dominated by sink mass and depth-induced norm growth respectively, so don't drive the prune decision off them — but if they disagree dramatically with the logit-lens / CKA picture, the disagreement is worth investigating.
 
-Aggregating these into a composite score and choosing the prune count `n` is in `T3_pruning_probe_step5to8.md` §1.
+Aggregating these into a composite score and choosing the prune count `n` is in `T3_pruning_probe_step5to8.md` §1. The composite score should be updated to include the logit-lens metrics — they are the strongest single signal of "this layer is doing thinking work."
 
 ---
 
