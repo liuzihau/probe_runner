@@ -50,6 +50,8 @@ def write_h5(
     block_seq_lens: list[int],
     block_mask_positions: list[list[int]],
     attention_sink_positions: list[int] | None = None,
+    special_token_positions: list[int] | None = None,
+    eos_pos_in_generated: int | None = None,
 ) -> None:
     """Write one sample's probe data to HDF5.
 
@@ -81,6 +83,10 @@ def write_h5(
         f.attrs["d_model"] = int(d_model)
         if attention_sink_positions is not None:
             f.attrs["attention_sink_positions"] = json.dumps(attention_sink_positions)
+        if special_token_positions is not None:
+            f.attrs["special_token_positions"] = json.dumps(special_token_positions)
+        if eos_pos_in_generated is not None:
+            f.attrs["eos_pos_in_generated"] = int(eos_pos_in_generated)
 
 
 def read_h5(path: str | Path) -> dict[str, Any]:
@@ -89,7 +95,8 @@ def read_h5(path: str | Path) -> dict[str, Any]:
     out: dict[str, Any] = {"blocks": {}, "attrs": {}}
     with h5py.File(path, "r") as f:
         for k, v in f.attrs.items():
-            if k in {"block_seq_lens", "block_mask_positions", "attention_sink_positions"}:
+            if k in {"block_seq_lens", "block_mask_positions", "attention_sink_positions",
+                     "special_token_positions"}:
                 out["attrs"][k] = json.loads(v)
             else:
                 out["attrs"][k] = v

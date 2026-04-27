@@ -154,6 +154,17 @@ def run_for_model(model_type: str, *, n_samples: int = 100, output_root: Path | 
             prompt_ids = prompt_ids[:, -max_prompt_tokens:]
         prompt_len = int(prompt_ids.shape[1])
 
+        # Identify special-token positions in the prompt (chat-template tokens, BOS, etc.)
+        prompt_ids_list = prompt_ids[0].tolist()
+        try:
+            special_ids_set = set(tokenizer.all_special_ids or [])
+        except Exception:
+            special_ids_set = set()
+        # Always treat position 0 as a sink (BOS / first-token attention sink heuristic)
+        special_token_positions = sorted(
+            {0} | {i for i, t in enumerate(prompt_ids_list) if t in special_ids_set}
+        )
+
         # Install probe hooks
         hooks = hooks_mod.ProbeHooks(
             model,
@@ -208,6 +219,18 @@ def run_for_model(model_type: str, *, n_samples: int = 100, output_root: Path | 
             generated_ids = output_ids[0, prompt_ids.shape[1]:].tolist()
             generated_text = tokenizer.decode(generated_ids, skip_special_tokens=True)
 
+            # Find first EOS-like token in generated portion. Multiple ids may count as end-of-answer.
+            end_token_ids: set[int] = set()
+            if getattr(tokenizer, "eos_token_id", None) is not None:
+                end_token_ids.add(int(tokenizer.eos_token_id))
+            if getattr(tokenizer, "pad_token_id", None) is not None:
+                end_token_ids.add(int(tokenizer.pad_token_id))
+            eos_pos_in_generated = len(generated_ids)  # default: never emitted
+            for i, t in enumerate(generated_ids):
+                if t in end_token_ids:
+                    eos_pos_in_generated = i
+                    break
+
             # Build per-block metadata
             block_seq_lens = []
             block_mask_positions = []
@@ -231,6 +254,8 @@ def run_for_model(model_type: str, *, n_samples: int = 100, output_root: Path | 
                 block_seq_lens=block_seq_lens,
                 block_mask_positions=block_mask_positions,
                 attention_sink_positions=[0],  # default — refined by sanity check
+                special_token_positions=special_token_positions,
+                eos_pos_in_generated=eos_pos_in_generated,
             )
 
             if sample_idx == 0:
