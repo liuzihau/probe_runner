@@ -16,17 +16,23 @@ from typing import Optional
 import torch
 import torch.nn.functional as F
 
+from probe_runner.configs import resolve_fast_dllm_path
 
-def _add_fast_dllm_to_path() -> None:
-    here = Path(__file__).resolve().parent
-    fast_dllm_dream = (here.parent / "related_repos" / "Fast-dLLM" / "v1" / "dream").resolve()
+
+def _add_fast_dllm_to_path(fast_dllm_path: str | Path | None = None) -> None:
+    root = resolve_fast_dllm_path(fast_dllm_path)
+    fast_dllm_dream = root / "dream"
     if str(fast_dllm_dream) not in sys.path:
         sys.path.insert(0, str(fast_dllm_dream))
 
 
-def load_dream(model_name: str = "Dream-org/Dream-v0-Instruct-7B", dtype: torch.dtype = torch.bfloat16):
+def load_dream(
+    model_name: str = "Dream-org/Dream-v0-Instruct-7B",
+    dtype: torch.dtype = torch.bfloat16,
+    fast_dllm_path: str | Path | None = None,
+):
     """Load Dream via the Fast-dLLM v1 wrapper (which adds the block-aware generation utils)."""
-    _add_fast_dllm_to_path()
+    _add_fast_dllm_to_path(fast_dllm_path)
     from transformers import AutoTokenizer  # noqa: WPS433
     # Fast-dLLM v1 ships a custom DreamModel + tokenization in its `model/` folder; importing
     # it via trust_remote_code on the HF id pulls the upstream version, so prefer the local one.

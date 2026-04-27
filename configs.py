@@ -5,6 +5,9 @@ See ../T3_pruning_probe_step1to4.md §8 for the spec this mirrors.
 
 from __future__ import annotations
 
+import os
+from pathlib import Path
+
 PROBE_CONFIG = {
     "models": {
         "llada": {
@@ -57,7 +60,7 @@ PROBE_CONFIG = {
         "attn_implementation": "manual_softmax",
     },
     "output": {
-        # Relative to T3 project root.
+        # Relative to the cwd (where you launch python -m probe_runner.run_probes).
         "root": "probes_out",
     },
 }
@@ -72,3 +75,38 @@ def derived(num_blocks: int = 8) -> dict:
         "block_length": g["block_length"],
         "steps_per_block": g["steps"] // num_blocks,
     }
+
+
+# ----------------------------------------------------------------------
+# Fast-dLLM v1 path resolution
+#
+# probe_runner depends on Fast-dLLM v1's `model.modeling_llada` and `model.modeling_dream` Python
+# modules. These are NOT bundled in this repo. The user clones Fast-dLLM separately (see ../README.md),
+# and we look it up via (in order of priority):
+#   1. explicit path passed at the call site
+#   2. environment variable FAST_DLLM_V1_PATH
+#   3. default: ./external/Fast-dLLM/v1   (relative to cwd)
+# ----------------------------------------------------------------------
+
+DEFAULT_FAST_DLLM_RELATIVE = Path("external") / "Fast-dLLM" / "v1"
+
+
+def resolve_fast_dllm_path(explicit: str | os.PathLike | None = None) -> Path:
+    """Find Fast-dLLM v1 root (the directory containing `llada/` and `dream/` subdirs)."""
+    if explicit is not None:
+        candidate = Path(explicit).expanduser().resolve()
+    elif os.environ.get("FAST_DLLM_V1_PATH"):
+        candidate = Path(os.environ["FAST_DLLM_V1_PATH"]).expanduser().resolve()
+    else:
+        candidate = (Path.cwd() / DEFAULT_FAST_DLLM_RELATIVE).resolve()
+
+    if not (candidate / "llada" / "model" / "modeling_llada.py").exists():
+        raise FileNotFoundError(
+            f"Fast-dLLM v1 not found at {candidate}.\n"
+            f"Expected file: {candidate / 'llada' / 'model' / 'modeling_llada.py'}\n\n"
+            f"Fix one of:\n"
+            f"  1. Run `bash setup.sh` from the directory that holds probe_runner/.\n"
+            f"  2. Pass --fast_dllm_path /your/path/to/Fast-dLLM/v1 .\n"
+            f"  3. Export FAST_DLLM_V1_PATH=/your/path/to/Fast-dLLM/v1 .\n"
+        )
+    return candidate

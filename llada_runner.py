@@ -14,18 +14,24 @@ import torch
 import torch.nn.functional as F
 import numpy as np
 
+from probe_runner.configs import resolve_fast_dllm_path
 
-def _add_fast_dllm_to_path() -> None:
+
+def _add_fast_dllm_to_path(fast_dllm_path: str | Path | None = None) -> None:
     """Add Fast-dLLM v1 LLaDA module dir to sys.path so its `model.modeling_llada` resolves."""
-    here = Path(__file__).resolve().parent
-    fast_dllm_llada = (here.parent / "related_repos" / "Fast-dLLM" / "v1" / "llada").resolve()
+    root = resolve_fast_dllm_path(fast_dllm_path)
+    fast_dllm_llada = root / "llada"
     if str(fast_dllm_llada) not in sys.path:
         sys.path.insert(0, str(fast_dllm_llada))
 
 
-def load_llada(model_name: str = "GSAI-ML/LLaDA-8B-Instruct", dtype: torch.dtype = torch.bfloat16):
+def load_llada(
+    model_name: str = "GSAI-ML/LLaDA-8B-Instruct",
+    dtype: torch.dtype = torch.bfloat16,
+    fast_dllm_path: str | Path | None = None,
+):
     """Load LLaDA via Fast-dLLM v1's LLaDAModelLM class."""
-    _add_fast_dllm_to_path()
+    _add_fast_dllm_to_path(fast_dllm_path)
     from model.modeling_llada import LLaDAModelLM  # noqa: WPS433
     from transformers import AutoTokenizer  # noqa: WPS433
 

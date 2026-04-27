@@ -92,7 +92,8 @@ def _check_first_block_sanity(buf_data: dict, prompt_len: int, num_blocks: int, 
 
 def run_for_model(model_type: str, *, n_samples: int = 100, output_root: Path | None = None,
                   max_prompt_tokens: int = 512, gen_length: int = 256, block_length: int = 32,
-                  steps: int = 256, threshold: float = 0.9) -> dict:
+                  steps: int = 256, threshold: float = 0.9,
+                  fast_dllm_path: str | Path | None = None) -> dict:
     output_root = output_root or Path(configs.PROBE_CONFIG["output"]["root"])
     out_dir = output_root / model_type
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -101,12 +102,12 @@ def run_for_model(model_type: str, *, n_samples: int = 100, output_root: Path | 
     print(f"[{model_type}] loading model …")
     if model_type == "llada":
         from probe_runner.llada_runner import load_llada, generate_with_probes
-        model, tokenizer = load_llada()
+        model, tokenizer = load_llada(fast_dllm_path=fast_dllm_path)
         format_prompt = _format_prompt_llada
         mask_token_id = configs.PROBE_CONFIG["models"]["llada"]["mask_token_id"]
     else:
         from probe_runner.dream_runner import load_dream, generate_with_probes
-        model, tokenizer = load_dream()
+        model, tokenizer = load_dream(fast_dllm_path=fast_dllm_path)
         format_prompt = _format_prompt_dream
         mask_token_id = getattr(model.config, "mask_token_id", None)
         if mask_token_id is None:
@@ -277,7 +278,18 @@ def main():
     parser.add_argument("--model", choices=["llada", "dream", "both"], default="both")
     parser.add_argument("--n_samples", type=int, default=configs.PROBE_CONFIG["dataset"]["n_samples"])
     parser.add_argument("--output_root", type=str, default=configs.PROBE_CONFIG["output"]["root"])
+    parser.add_argument(
+        "--fast_dllm_path",
+        type=str,
+        default=None,
+        help="Path to Fast-dLLM v1 (the dir that contains llada/ and dream/). "
+             "Defaults to env FAST_DLLM_V1_PATH or ./external/Fast-dLLM/v1.",
+    )
     args = parser.parse_args()
+
+    # Validate Fast-dLLM is reachable BEFORE we start loading large models.
+    fdp = configs.resolve_fast_dllm_path(args.fast_dllm_path)
+    print(f"Using Fast-dLLM v1 at: {fdp}")
 
     output_root = Path(args.output_root)
     output_root.mkdir(parents=True, exist_ok=True)
@@ -285,7 +297,12 @@ def main():
     summaries = {}
     targets = ["llada", "dream"] if args.model == "both" else [args.model]
     for m in targets:
-        summaries[m] = run_for_model(m, n_samples=args.n_samples, output_root=output_root)
+        summaries[m] = run_for_model(
+            m,
+            n_samples=args.n_samples,
+            output_root=output_root,
+            fast_dllm_path=args.fast_dllm_path,
+        )
 
     write_meta(summaries, output_root)
     print("Done.")

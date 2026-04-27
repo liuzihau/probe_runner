@@ -1,0 +1,17 @@
+# Core ML stack — versions chosen to match Fast-dLLM v1 expectations.
+# If you already have these installed, the bash setup will be a no-op for you.
+torch>=2.1
+transformers>=4.40,<5.0
+accelerate>=0.27
+datasets>=2.18
+
+# I/O + numerics
+h5py>=3.10
+numpy>=1.24
+
+# Plotting
+matplotlib>=3.7
+
+# Misc
+tqdm
+sentencepiece
