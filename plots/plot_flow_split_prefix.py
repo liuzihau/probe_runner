@@ -1,17 +1,23 @@
-"""Plot Probe A with prefix split into RECENT vs DISTANT.
+"""Plot Probe A with three partitions: RECENT prefix, DISTANT prefix, CURRENT block.
 
 For each block k:
-  - "recent" prefix = positions in [block_start - W, block_start), excluding sinks/specials.
-  - "distant" prefix = positions in [0, block_start - W), excluding sinks/specials.
+  - "recent" prefix  = positions in [block_start - W, block_start), excluding sinks/specials.
+  - "distant" prefix = positions in [0, block_start - W),            excluding sinks/specials.
+  - "current" block  = positions in [block_start, block_start + 32), excluding sinks/specials
+                       (essentially the masked block itself; gives a "reverse look" — how
+                        much each masked token attends to others within the same block).
 
-Where W = --recent_window (default 8 tokens). This separates "local context immediately
-before the masked block" from "the rest of the prompt and earlier decoded blocks."
+Where W = --recent_window (default 8 tokens).
+
+For the *_normalized variants the denominator is:
+  * default (--include_future OFF): old + recent + current  (positions [0, block_end))
+  * with --include_future:           above + future masked blocks  (positions [0, S_b))
 
 Same EOS-cutoff and special-token-subtraction filters as plot_info_flow_to_prefix.py.
 
 Run:
     python -m probe_runner.plots.plot_flow_split_prefix --model llada
-    python -m probe_runner.plots.plot_flow_split_prefix --model llada --variant flow --recent_window 8
+    python -m probe_runner.plots.plot_flow_split_prefix --model llada --variant flow_normalized
 """
 
 from __future__ import annotations
@@ -39,19 +45,22 @@ def _per_layer_per_block_split_signal(
     apply_eos_cutoff: bool,
     apply_special_filter: bool,
     include_future: bool = False,
-) -> tuple[np.ndarray, np.ndarray, list[int], dict]:
-    """Compute (recent_arr, distant_arr) of shape [num_blocks, L, H] each.
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, list[int], dict]:
+    """Compute (recent_arr, distant_arr, current_arr) of shape [num_blocks, L, H] each.
 
-    For block 0 the "distant" partition may be empty (if block_start ≤ recent_window);
-    those blocks return NaN for the distant array, which the plotter skips.
+    For blocks where the "distant" partition is empty (e.g., very short prompts at block 0),
+    that block's slot is NaN; the plotter masks those out.
     """
     accum_recent: dict[int, np.ndarray] = {}
     accum_distant: dict[int, np.ndarray] = {}
+    accum_current: dict[int, np.ndarray] = {}
     counts_recent: dict[int, int] = {}
     counts_distant: dict[int, int] = {}
+    counts_current: dict[int, int] = {}
     diagnostics = {
         "n_files": len(files),
         "recent_window": recent_window,
+        "include_future": include_future,
         "samples_with_eos": 0,
         "mean_eos_pos": 0.0,
         "blocks_kept_per_sample": {b: 0 for b in range(8)},
@@ -77,37 +86,36 @@ def _per_layer_per_block_split_signal(
             attn_kept = attn[allowed_m]
 
             block_start_abs = prompt_len + b * num_masked
+            block_end_abs = block_start_abs + num_masked
             recent_lo = max(0, block_start_abs - recent_window)
             recent_hi = block_start_abs
 
-            recent_idx = [j for j in range(recent_lo, recent_hi) if j not in special_positions]
-            distant_idx = [j for j in range(0, recent_lo) if j not in special_positions]
+            recent_idx  = [j for j in range(recent_lo,         recent_hi)     if j not in special_positions]
+            distant_idx = [j for j in range(0,                 recent_lo)     if j not in special_positions]
+            current_idx = [j for j in range(block_start_abs,   block_end_abs) if j not in special_positions]
 
             v_norm = blk.get("v_norm")
-            if variant in ("flow", "flow_normalized", "attn_normalized") and v_norm is None and variant != "attn_normalized":
+            if variant in ("flow", "flow_normalized") and v_norm is None:
                 continue
             if v_norm is not None:
                 v_norm = v_norm.astype(np.float32)
 
-            # Denominator index list for the *_normalized variants:
+            # Denominator for *_normalized:
             #   include_future=False  → [0, block_end) excluding sinks/specials
-            #                            = old prefix + recent prefix + current block
+            #                            = old + recent + current
             #   include_future=True   → [0, S_b) excluding sinks/specials
-            #                            = above + future masked blocks
-            block_end_abs = block_start_abs + num_masked
             if include_future:
                 denom_idx = [j for j in range(S_b) if j not in special_positions]
             else:
                 denom_idx = [j for j in range(block_end_abs) if j not in special_positions]
 
-            # Precompute the total once per (sample, block) for normalized variants
             denom_total = None
             if variant == "attn_normalized" and len(denom_idx) > 0:
-                denom_total = attn_kept[..., denom_idx].sum(axis=-1)            # [n_kept, L, H]
+                denom_total = attn_kept[..., denom_idx].sum(axis=-1)
             elif variant == "flow_normalized" and len(denom_idx) > 0 and v_norm is not None:
                 v_d = v_norm[..., denom_idx]
                 a_d = attn_kept[..., denom_idx]
-                denom_total = (a_d * v_d[None, ...]).sum(axis=-1)               # [n_kept, L, H]
+                denom_total = (a_d * v_d[None, ...]).sum(axis=-1)
 
             def _signal_over(idx_list):
                 if len(idx_list) == 0:
@@ -130,119 +138,141 @@ def _per_layer_per_block_split_signal(
                     return flow_part / (denom_total + 1e-9)
                 raise ValueError(variant)
 
-            sig_recent = _signal_over(recent_idx)
-            sig_distant = _signal_over(distant_idx)
-
-            if sig_recent is not None:
-                m = sig_recent.mean(axis=0)
-                if b not in accum_recent:
-                    accum_recent[b] = m
-                    counts_recent[b] = 1
+            for accum, counts, idx in (
+                (accum_recent,  counts_recent,  recent_idx),
+                (accum_distant, counts_distant, distant_idx),
+                (accum_current, counts_current, current_idx),
+            ):
+                sig = _signal_over(idx)
+                if sig is None:
+                    continue
+                m = sig.mean(axis=0)
+                # Find which dict by identity to update count
+                for b_, _ in [(b, None)]:
+                    pass
+                if b not in accum:
+                    accum[b] = m
+                    counts[b] = 1
                 else:
-                    accum_recent[b] = accum_recent[b] + m
-                    counts_recent[b] = counts_recent[b] + 1
-            if sig_distant is not None:
-                m = sig_distant.mean(axis=0)
-                if b not in accum_distant:
-                    accum_distant[b] = m
-                    counts_distant[b] = 1
-                else:
-                    accum_distant[b] = accum_distant[b] + m
-                    counts_distant[b] = counts_distant[b] + 1
+                    accum[b] = accum[b] + m
+                    counts[b] = counts[b] + 1
 
             diagnostics["blocks_kept_per_sample"][b] = diagnostics["blocks_kept_per_sample"].get(b, 0) + 1
 
     diagnostics["mean_eos_pos"] = float(np.mean(eos_positions)) if eos_positions else 0.0
-    blocks = sorted(set(accum_recent.keys()) | set(accum_distant.keys()))
+    blocks = sorted(set(accum_recent) | set(accum_distant) | set(accum_current))
 
     def _stack(accum, counts, blocks_):
+        if not accum:
+            # Build a NaN array with a plausible shape from any other accum
+            return np.full((len(blocks_), 1, 1), np.nan)
+        ref_shape = next(iter(accum.values())).shape
         out = []
         for b in blocks_:
             if b in accum:
                 out.append(accum[b] / counts[b])
             else:
-                # Pad with NaN so plotting can mask it out
-                shape = next(iter(accum.values())).shape if accum else None
-                out.append(np.full(shape, np.nan) if shape else None)
+                out.append(np.full(ref_shape, np.nan))
         return np.stack(out, axis=0)
 
-    recent_arr = _stack(accum_recent, counts_recent, blocks)
+    recent_arr  = _stack(accum_recent,  counts_recent,  blocks)
     distant_arr = _stack(accum_distant, counts_distant, blocks)
-    return recent_arr, distant_arr, blocks, diagnostics
+    current_arr = _stack(accum_current, counts_current, blocks)
+    return recent_arr, distant_arr, current_arr, blocks, diagnostics
 
 
-def _plot_split(
+# ---------------------------------------------------------------------------
+# Plotting (uses subfigures so section labels never overlap subplot titles)
+# ---------------------------------------------------------------------------
+
+def _plot_split_3way(
     recent_arr: np.ndarray,
     distant_arr: np.ndarray,
+    current_arr: np.ndarray,
     blocks: list[int],
     title: str,
     out_path: Path,
     y_label: str,
+    recent_window: int,
 ):
-    """One figure with two stacked 8-block heatmap rows + overlaid summary curves."""
-    num_blocks, L, H = recent_arr.shape
-    fig = plt.figure(figsize=(20, 14), constrained_layout=True)
-    gs = fig.add_gridspec(5, 4, height_ratios=[3, 3, 3, 3, 3])
+    num_blocks = recent_arr.shape[0]
+    L = recent_arr.shape[1] if recent_arr.shape[1] > 1 else (
+        distant_arr.shape[1] if distant_arr.shape[1] > 1 else current_arr.shape[1]
+    )
 
-    # Joint color scale across both partitions for fair visual comparison
-    finite_vals = np.concatenate([
-        recent_arr[~np.isnan(recent_arr)].ravel(),
-        distant_arr[~np.isnan(distant_arr)].ravel(),
-    ])
-    vmin, vmax = float(finite_vals.min()), float(finite_vals.max())
+    # Joint color scale across all three partitions
+    finite = []
+    for a in (recent_arr, distant_arr, current_arr):
+        flat = a[~np.isnan(a)].ravel()
+        if flat.size > 0:
+            finite.append(flat)
+    finite = np.concatenate(finite) if finite else np.array([0.0, 1.0])
+    vmin, vmax = float(finite.min()), float(finite.max())
+
+    fig = plt.figure(figsize=(22, 26))
+    fig.suptitle(title, fontsize=15, y=0.995, fontweight="bold")
+
+    subfigs = fig.subfigures(
+        4, 1,
+        height_ratios=[3.0, 3.0, 3.0, 2.5],
+        hspace=0.04,
+    )
+
+    sections = [
+        (subfigs[0], recent_arr,  f"RECENT prefix  [-{recent_window}:]  (last {recent_window} tokens before block start)", "tab:blue"),
+        (subfigs[1], distant_arr, f"DISTANT prefix  [0:-{recent_window}]  (everything earlier)",                            "tab:red"),
+        (subfigs[2], current_arr,  "CURRENT BLOCK  (the 32 mask positions of block k itself — reverse look)",               "tab:green"),
+    ]
 
     last_im = None
+    for sf, arr, label, color in sections:
+        sf.suptitle(label, fontsize=13, color=color, fontweight="bold", y=0.99)
+        axes = sf.subplots(2, 4)
+        for i, b in enumerate(blocks[:8]):
+            ax = axes[i // 4, i % 4]
+            if not np.all(np.isnan(arr[i])):
+                last_im = ax.imshow(
+                    arr[i].T, aspect="auto", origin="lower",
+                    vmin=vmin, vmax=vmax, cmap="viridis",
+                )
+            ax.set_title(f"block {b}", fontsize=10)
+            ax.set_xlabel("layer ℓ", fontsize=9)
+            ax.set_ylabel("head h", fontsize=9)
+        # Tighten internal spacing
+        sf.subplots_adjust(top=0.86, bottom=0.10, left=0.05, right=0.97, hspace=0.55, wspace=0.30)
 
-    # Row 1+2: recent heatmaps (8 subplots)
-    fig.text(0.5, 0.995, "RECENT prefix (last W tokens before block start)",
-             ha="center", fontsize=11, color="darkblue")
-    for i, b in enumerate(blocks[:8]):
-        ax = fig.add_subplot(gs[i // 4, i % 4])
-        if not np.all(np.isnan(recent_arr[i])):
-            last_im = ax.imshow(recent_arr[i].T, aspect="auto", origin="lower",
-                                vmin=vmin, vmax=vmax, cmap="viridis")
-        ax.set_title(f"block {b} — recent")
-        ax.set_xlabel("layer ℓ")
-        ax.set_ylabel("head h")
-
-    # Row 3+4: distant heatmaps
-    fig.text(0.5, 0.595, "DISTANT prefix (everything earlier)",
-             ha="center", fontsize=11, color="darkred")
-    for i, b in enumerate(blocks[:8]):
-        ax = fig.add_subplot(gs[2 + i // 4, i % 4])
-        if not np.all(np.isnan(distant_arr[i])):
-            last_im = ax.imshow(distant_arr[i].T, aspect="auto", origin="lower",
-                                vmin=vmin, vmax=vmax, cmap="viridis")
-        ax.set_title(f"block {b} — distant")
-        ax.set_xlabel("layer ℓ")
-        ax.set_ylabel("head h")
-
+    # Shared colorbar at the right of the heatmap rows
     if last_im is not None:
-        fig.colorbar(last_im, ax=fig.axes, fraction=0.02, pad=0.02, shrink=0.6)
+        cbar_ax = fig.add_axes([0.985, 0.30, 0.008, 0.55])
+        fig.colorbar(last_im, cax=cbar_ax)
 
-    # Row 5: summary curves (recent solid, distant dashed)
-    ax = fig.add_subplot(gs[4, :])
-    recent_curves = np.nanmean(recent_arr, axis=-1)   # [num_blocks, L]
-    distant_curves = np.nanmean(distant_arr, axis=-1)  # [num_blocks, L]
+    # Summary subfigure: 3 side-by-side line plots (recent | distant | current_block)
+    sf_summary = subfigs[3]
+    sf_summary.suptitle("Per-layer summary (mean over heads)", fontsize=12, y=0.97)
+    axes_s = sf_summary.subplots(1, 3)
     cmap = plt.colormaps["tab10"]
-    for i, b in enumerate(blocks):
-        c = cmap(i % 10)
-        ax.plot(range(L), recent_curves[i], label=f"block {b} recent", alpha=0.7,
-                color=c, linestyle="-")
-        if not np.all(np.isnan(distant_curves[i])):
-            ax.plot(range(L), distant_curves[i], label=f"block {b} distant", alpha=0.7,
-                    color=c, linestyle="--")
-    ax.plot(range(L), np.nanmean(recent_curves, axis=0), color="black", linewidth=2.5,
-            label="mean RECENT")
-    ax.plot(range(L), np.nanmean(distant_curves, axis=0), color="dimgray", linewidth=2.5,
-            linestyle="--", label="mean DISTANT")
-    ax.set_xlabel("layer ℓ")
-    ax.set_ylabel(y_label)
-    ax.set_title(title + " — per-layer (mean over heads). Solid = RECENT, Dashed = DISTANT.")
-    ax.legend(ncol=4, fontsize=7, loc="best")
-    ax.grid(True, alpha=0.3)
 
-    fig.suptitle(title, fontsize=14, y=1.02)
+    for ax_s, arr, label, color in zip(
+        axes_s,
+        [recent_arr, distant_arr, current_arr],
+        ["RECENT", "DISTANT", "CURRENT BLOCK"],
+        ["tab:blue", "tab:red", "tab:green"],
+    ):
+        curves = np.nanmean(arr, axis=-1)  # [num_blocks, L]
+        for i, b in enumerate(blocks):
+            if np.all(np.isnan(curves[i])):
+                continue
+            ax_s.plot(range(L), curves[i], label=f"block {b}", alpha=0.7, color=cmap(i % 10))
+        if not np.all(np.isnan(curves)):
+            ax_s.plot(range(L), np.nanmean(curves, axis=0),
+                      color="black", linewidth=2.5, label="mean")
+        ax_s.set_xlabel("layer ℓ")
+        ax_s.set_ylabel(y_label)
+        ax_s.set_title(label, fontsize=12, color=color, fontweight="bold")
+        ax_s.legend(ncol=2, fontsize=8, loc="best")
+        ax_s.grid(True, alpha=0.3)
+    sf_summary.subplots_adjust(top=0.85, bottom=0.18, left=0.05, right=0.97, wspace=0.25)
+
     out_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(out_path, dpi=150, bbox_inches="tight")
     fig.savefig(out_path.with_suffix(".pdf"), bbox_inches="tight")
@@ -301,29 +331,34 @@ def main():
     for v in variants:
         print(f"[{args.model}] split-prefix variant={v} W={args.recent_window} "
               f"include_future={args.include_future} on {len(files)} files …")
-        recent_arr, distant_arr, blocks, diag = _per_layer_per_block_split_signal(
+        recent_arr, distant_arr, current_arr, blocks, diag = _per_layer_per_block_split_signal(
             files, v, model_name=args.model, recent_window=args.recent_window,
             apply_eos_cutoff=apply_eos, apply_special_filter=apply_special,
             include_future=args.include_future,
         )
         if diagnostics_collected is None:
             diagnostics_collected = diag
+
         if v == "attn":
-            title = f"{args.model} — raw attention to prefix (split, W={args.recent_window})"
+            title = f"{args.model} — raw attention split (W={args.recent_window})"
             ylabel = "Σ attn ∈ [0, 1]"
         elif v == "flow":
-            title = f"{args.model} — info flow (attn × ||W_O·v||) to prefix (split, W={args.recent_window})"
+            title = f"{args.model} — info flow (attn × ||W_O·v||) split (W={args.recent_window})"
             ylabel = "Σ (attn · v_norm)"
         elif v == "attn_normalized":
-            title = (f"{args.model} — normalized raw attention (split, W={args.recent_window})\n"
+            title = (f"{args.model} — normalized raw attention split (W={args.recent_window})\n"
                      f"denominator: {denom_label}")
             ylabel = "attn_part / attn_total ∈ [0, 1]"
         else:  # flow_normalized
-            title = (f"{args.model} — normalized info flow (split, W={args.recent_window})\n"
+            title = (f"{args.model} — normalized info flow split (W={args.recent_window})\n"
                      f"denominator: {denom_label}")
             ylabel = "flow_part / flow_total ∈ [0, 1]"
+
         out_png = plots_dir / f"flow_split_W{args.recent_window}_{args.model}_{v}{suffix_str}.png"
-        _plot_split(recent_arr, distant_arr, blocks, title, out_png, y_label=ylabel)
+        _plot_split_3way(
+            recent_arr, distant_arr, current_arr, blocks,
+            title=title, out_path=out_png, y_label=ylabel, recent_window=args.recent_window,
+        )
         print(f"[{args.model}] saved {out_png}")
 
     if diagnostics_collected is not None:
