@@ -38,6 +38,7 @@ def _per_layer_per_block_split_signal(
     recent_window: int,
     apply_eos_cutoff: bool,
     apply_special_filter: bool,
+    include_future: bool = False,
 ) -> tuple[np.ndarray, np.ndarray, list[int], dict]:
     """Compute (recent_arr, distant_arr) of shape [num_blocks, L, H] each.
 
@@ -83,10 +84,30 @@ def _per_layer_per_block_split_signal(
             distant_idx = [j for j in range(0, recent_lo) if j not in special_positions]
 
             v_norm = blk.get("v_norm")
-            if variant in ("flow", "flow_normalized") and v_norm is None:
+            if variant in ("flow", "flow_normalized", "attn_normalized") and v_norm is None and variant != "attn_normalized":
                 continue
             if v_norm is not None:
                 v_norm = v_norm.astype(np.float32)
+
+            # Denominator index list for the *_normalized variants:
+            #   include_future=False  → [0, block_end) excluding sinks/specials
+            #                            = old prefix + recent prefix + current block
+            #   include_future=True   → [0, S_b) excluding sinks/specials
+            #                            = above + future masked blocks
+            block_end_abs = block_start_abs + num_masked
+            if include_future:
+                denom_idx = [j for j in range(S_b) if j not in special_positions]
+            else:
+                denom_idx = [j for j in range(block_end_abs) if j not in special_positions]
+
+            # Precompute the total once per (sample, block) for normalized variants
+            denom_total = None
+            if variant == "attn_normalized" and len(denom_idx) > 0:
+                denom_total = attn_kept[..., denom_idx].sum(axis=-1)            # [n_kept, L, H]
+            elif variant == "flow_normalized" and len(denom_idx) > 0 and v_norm is not None:
+                v_d = v_norm[..., denom_idx]
+                a_d = attn_kept[..., denom_idx]
+                denom_total = (a_d * v_d[None, ...]).sum(axis=-1)               # [n_kept, L, H]
 
             def _signal_over(idx_list):
                 if len(idx_list) == 0:
@@ -97,14 +118,16 @@ def _per_layer_per_block_split_signal(
                 if variant == "flow":
                     v = v_norm[..., idx_list]
                     return (a * v[None, ...]).sum(axis=-1)
+                if variant == "attn_normalized":
+                    if denom_total is None:
+                        return None
+                    return a.sum(axis=-1) / (denom_total + 1e-9)
                 if variant == "flow_normalized":
+                    if denom_total is None:
+                        return None
                     v = v_norm[..., idx_list]
                     flow_part = (a * v[None, ...]).sum(axis=-1)
-                    all_idx = [j for j in range(S_b) if j not in special_positions]
-                    v_all = v_norm[..., all_idx]
-                    a_all = attn_kept[..., all_idx]
-                    flow_total = (a_all * v_all[None, ...]).sum(axis=-1)
-                    return flow_part / (flow_total + 1e-9)
+                    return flow_part / (denom_total + 1e-9)
                 raise ValueError(variant)
 
             sig_recent = _signal_over(recent_idx)
@@ -230,12 +253,21 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", choices=["llada", "dream"], required=True)
     parser.add_argument("--probes_root", type=str, default="probes_out")
-    parser.add_argument("--variant", choices=["attn", "flow", "flow_normalized", "all"],
-                        default="all")
+    parser.add_argument(
+        "--variant",
+        choices=["attn", "flow", "attn_normalized", "flow_normalized", "all"],
+        default="all",
+    )
     parser.add_argument("--recent_window", type=int, default=8,
                         help="How many tokens before block_start count as 'recent prefix'.")
     parser.add_argument("--no_eos_cutoff", action="store_true")
     parser.add_argument("--no_special_filter", action="store_true")
+    parser.add_argument(
+        "--include_future",
+        action="store_true",
+        help="For *_normalized variants: include future masked blocks in the denominator. "
+             "Default OFF — denominator = old_prefix + recent_prefix + current_block.",
+    )
     args = parser.parse_args()
 
     probes_root = Path(args.probes_root)
@@ -247,21 +279,32 @@ def main():
 
     apply_eos = not args.no_eos_cutoff
     apply_special = not args.no_special_filter
-    variants = ["attn", "flow", "flow_normalized"] if args.variant == "all" else [args.variant]
+    if args.variant == "all":
+        variants = ["attn", "flow", "attn_normalized", "flow_normalized"]
+    else:
+        variants = [args.variant]
 
     suffix = []
     if apply_eos:
         suffix.append("eosfilter")
     if apply_special:
         suffix.append("specialfilter")
+    if args.include_future:
+        suffix.append("incfut")
     suffix_str = "_" + "_".join(suffix) if suffix else ""
+
+    denom_label = ("old + recent + current + future"
+                   if args.include_future else
+                   "old + recent + current  (no future masks)")
 
     diagnostics_collected = None
     for v in variants:
-        print(f"[{args.model}] split-prefix variant={v} W={args.recent_window} on {len(files)} files …")
+        print(f"[{args.model}] split-prefix variant={v} W={args.recent_window} "
+              f"include_future={args.include_future} on {len(files)} files …")
         recent_arr, distant_arr, blocks, diag = _per_layer_per_block_split_signal(
             files, v, model_name=args.model, recent_window=args.recent_window,
             apply_eos_cutoff=apply_eos, apply_special_filter=apply_special,
+            include_future=args.include_future,
         )
         if diagnostics_collected is None:
             diagnostics_collected = diag
@@ -271,8 +314,13 @@ def main():
         elif v == "flow":
             title = f"{args.model} — info flow (attn × ||W_O·v||) to prefix (split, W={args.recent_window})"
             ylabel = "Σ (attn · v_norm)"
-        else:
-            title = f"{args.model} — normalized info flow (split, W={args.recent_window})"
+        elif v == "attn_normalized":
+            title = (f"{args.model} — normalized raw attention (split, W={args.recent_window})\n"
+                     f"denominator: {denom_label}")
+            ylabel = "attn_part / attn_total ∈ [0, 1]"
+        else:  # flow_normalized
+            title = (f"{args.model} — normalized info flow (split, W={args.recent_window})\n"
+                     f"denominator: {denom_label}")
             ylabel = "flow_part / flow_total ∈ [0, 1]"
         out_png = plots_dir / f"flow_split_W{args.recent_window}_{args.model}_{v}{suffix_str}.png"
         _plot_split(recent_arr, distant_arr, blocks, title, out_png, y_label=ylabel)
