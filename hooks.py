@@ -92,10 +92,27 @@ class _BlockBuffer:
                                                                       # h[0] = embedding output, h[1..L] = block outputs
 
 
+@dataclass
+class _IntraPassBuffer:
+    """Per-(block, pass) recording for intra-block drift analysis.
+
+    `h` accumulates one tensor per layer (incl. embed at index 0), each of shape
+    [num_masked, d_model]. `token_state` is a [num_masked] int8 tensor saying
+    whether each position is mask (0) or clean (1) at the *input* of this pass.
+    `revealed_this_pass` is [num_masked] bool: was this pass the one that
+    flipped the position from mask→clean? Filled in at pass-end.
+    """
+    h: list[torch.Tensor] = field(default_factory=list)
+    token_state: torch.Tensor | None = None
+    revealed_this_pass: torch.Tensor | None = None
+
+
 class ProbeHooks:
     """Install probe hooks for one (model, sample) recording session.
 
-    Workflow:
+    Two modes:
+
+    Legacy (default, `intra_block=False`):
         hooks = ProbeHooks(model, model_type="llada", n_layers=..., n_heads=...)
         for block_idx in range(num_blocks):
             hooks.set_block(block_idx, masked_positions_abs)
@@ -104,6 +121,23 @@ class ProbeHooks:
             hooks.armed = False
             # ... rest of block's parallel-decoding steps run with armed=False ...
         data_per_block = hooks.collect()
+        hooks.remove()
+
+    Intra-block (`intra_block=True`): hooks stay armed across every pass within
+    a block. Per-pass `h` is captured; `attn` and `v_norm` are still pass-0 only
+    (we already have those, and recording attn at every pass would force manual
+    softmax across the whole inner loop and ~2× the wall time).
+
+        hooks = ProbeHooks(..., intra_block=True)
+        for block_idx in range(num_blocks):
+            hooks.set_block(block_idx, masked_positions_abs)
+            for pass_idx in range(steps_per_block):
+                hooks.set_pass(block_idx, pass_idx, token_state=...)
+                hooks.armed = True
+                model(...)
+                hooks.armed = False
+                hooks.finalize_pass(revealed_this_pass=...)
+        data_per_block, intra_per_block = hooks.collect()
         hooks.remove()
     """
 
@@ -115,20 +149,30 @@ class ProbeHooks:
         n_heads: int,
         d_head: int,
         record_v_norm: bool = True,
+        intra_block: bool = False,
     ):
         self.model_type = model_type
         self.n_layers = n_layers
         self.n_heads = n_heads
         self.d_head = d_head
         self.record_v_norm = record_v_norm
+        self.intra_block = bool(intra_block)
 
         self.armed = False
         self.current_block: int | None = None
-        self.masked_positions: list[int] | None = None
+        self.current_pass: int | None = None
+        self.masked_positions: list[int] | None = None  # absolute positions; legacy
+        # `current_indices` is what hooks actually use to slice `outputs`. At
+        # pass 0 it equals `masked_positions` (the model sees the full
+        # sequence). At pass ≥ 1 the runner calls model(x[:, s:e]) so it sets
+        # current_indices to the *local* range list(range(block_length)).
+        self.current_indices: list[int] | None = None
         self.expected_seq_len: int | None = None
 
-        # Per-block accumulator
+        # Per-block accumulator (legacy: pass-0 attn + v_norm + h_masked)
         self._buffers: dict[int, _BlockBuffer] = {}
+        # Per-(block, pass) accumulator (intra_block mode only)
+        self._intra_buffers: dict[int, dict[int, _IntraPassBuffer]] = {}
 
         self._handles: list[torch.utils.hooks.RemovableHandle] = []
         self._patched_objs: list[tuple[Any, str, Any]] = []  # (obj, attr, original) for unpatching
@@ -144,8 +188,51 @@ class ProbeHooks:
 
     def set_block(self, block_idx: int, masked_positions: list[int]) -> None:
         self.current_block = block_idx
+        self.current_pass = None
         self.masked_positions = list(masked_positions)
+        self.current_indices = list(masked_positions)  # default: pass 0 uses absolute
         self._buffers[block_idx] = _BlockBuffer()
+        if self.intra_block:
+            self._intra_buffers[block_idx] = {}
+
+    def set_pass(
+        self,
+        block_idx: int,
+        pass_idx: int,
+        *,
+        token_state: torch.Tensor | None = None,
+        indices: list[int] | None = None,
+    ) -> None:
+        """Tag the next forward as belonging to (block_idx, pass_idx).
+
+        `token_state` is a [num_masked] int8/bool tensor of pre-pass token
+        states. Stored on the per-pass buffer so analyses can group positions
+        by mask/clean transitions across consecutive passes.
+
+        `indices` overrides which positions of `outputs` the hooks slice for
+        this pass. Required at pass ≥ 1 because the model is called with
+        `x[:, s:e]` and the hidden-state tensors are *block-local* (length
+        `block_length`), not full-sequence — so absolute positions would
+        index out of bounds. At pass 0 the model gets the full sequence and
+        the absolute `masked_positions` set by `set_block` works.
+        """
+        self.current_block = block_idx
+        self.current_pass = pass_idx
+        if indices is not None:
+            self.current_indices = list(indices)
+        if self.intra_block:
+            buf = _IntraPassBuffer()
+            if token_state is not None:
+                buf.token_state = token_state.detach().to(torch.int8).cpu()
+            self._intra_buffers.setdefault(block_idx, {})[pass_idx] = buf
+
+    def finalize_pass(self, revealed_this_pass: torch.Tensor | None = None) -> None:
+        """Attach the post-pass reveal mask to the current pass buffer."""
+        if not self.intra_block or self.current_block is None or self.current_pass is None:
+            return
+        buf = self._intra_buffers[self.current_block].get(self.current_pass)
+        if buf is not None and revealed_this_pass is not None:
+            buf.revealed_this_pass = revealed_this_pass.detach().to(torch.bool).cpu()
 
     def collect(self) -> dict[int, dict[str, torch.Tensor]]:
         """Stack per-layer lists into [L, ...] tensors per block.
@@ -160,6 +247,48 @@ class ProbeHooks:
             v_norm = torch.stack(buf.v_norm, dim=0) if buf.v_norm else None  # → [L, H, S]
             h = torch.stack(buf.h, dim=0) if buf.h else None  # → [L+1, num_masked, d_model]
             out[block_idx] = {"attn": attn, "v_norm": v_norm, "h_masked": h}
+        return out
+
+    def collect_intra_block(self) -> dict[int, dict[str, torch.Tensor]]:
+        """Stack per-pass `h` lists into per-block tensors.
+
+        Returns mapping: block_idx → {
+            "h_per_pass":            [n_passes, L+1, num_masked, d_model] float16,
+            "token_state_per_pass":  [n_passes, num_masked] int8,
+            "revealed_per_pass":     [n_passes, num_masked] bool,
+        }
+        Empty dict when `intra_block=False`. Blocks where all passes ran
+        get a uniform first dimension; ragged-by-block (different blocks
+        can have different `n_passes` due to early-exit when block fully
+        decoded).
+        """
+        out: dict[int, dict[str, torch.Tensor]] = {}
+        if not self.intra_block:
+            return out
+        for block_idx, pass_map in self._intra_buffers.items():
+            if not pass_map:
+                continue
+            sorted_passes = sorted(pass_map.keys())
+            # Drop trailing passes that have no h recorded (e.g. armed=False
+            # because the runner detected early-exit before firing the model).
+            sorted_passes = [p for p in sorted_passes if pass_map[p].h]
+            if not sorted_passes:
+                continue
+            h_stacks = []
+            ts_list, rv_list = [], []
+            for p in sorted_passes:
+                buf = pass_map[p]
+                h_stacks.append(torch.stack(buf.h, dim=0))  # [L+1, num_masked, d_model]
+                ts_list.append(buf.token_state if buf.token_state is not None
+                               else torch.zeros(len(self.masked_positions or []), dtype=torch.int8))
+                rv_list.append(buf.revealed_this_pass if buf.revealed_this_pass is not None
+                               else torch.zeros(len(self.masked_positions or []), dtype=torch.bool))
+            out[block_idx] = {
+                "h_per_pass":           torch.stack(h_stacks, dim=0),
+                "token_state_per_pass": torch.stack(ts_list, dim=0),
+                "revealed_per_pass":    torch.stack(rv_list, dim=0),
+                "pass_indices":         torch.tensor(sorted_passes, dtype=torch.int32),
+            }
         return out
 
     def remove(self) -> None:
@@ -211,7 +340,15 @@ class ProbeHooks:
                 k_full = k
                 v_full = v
 
-            if hooks_self.armed and hooks_self.current_block is not None:
+            # Skip manual-softmax capture on intra-block passes ≥ 1: we
+            # already have attn/v_norm at pass 0, and forcing manual softmax
+            # for the rest of the block ~doubles inference time.
+            capture_attn = (
+                hooks_self.armed
+                and hooks_self.current_block is not None
+                and (hooks_self.current_pass is None or hooks_self.current_pass == 0)
+            )
+            if capture_attn:
                 # Manual softmax to expose attention weights and keep v
                 out, attn = _manual_attention(q, k_full, v_full, attn_mask=attn_mask)
                 # attn: [B=1, H, T_q, T_k] ; T_k is sequence length seen.
@@ -234,7 +371,9 @@ class ProbeHooks:
                     buf.v_norm.append(v_norm)
                 return out
             else:
-                # Disarmed: fall back to the original (uses flash/SDPA — fast).
+                # Disarmed OR intra-block pass ≥ 1: fall back to the
+                # original (uses flash/SDPA — fast). The block-output
+                # forward hook still records `h` per pass.
                 return original(q, k, v, attn_mask=attn_mask, dropout_p=dropout_p, is_causal=is_causal)
 
         block._scaled_dot_product_attention = patched_sdpa
@@ -275,7 +414,14 @@ class ProbeHooks:
 
         def patched_forward(hidden_states, attention_mask=None, position_ids=None,
                             past_key_value=None, output_attentions=False, use_cache=False, **kwargs):
-            if not hooks_self.armed or hooks_self.current_block is None:
+            # Skip manual-softmax capture on intra-block passes ≥ 1 for the
+            # same reason as the LLaDA path (avoid 2× inference cost).
+            capture_attn = (
+                hooks_self.armed
+                and hooks_self.current_block is not None
+                and (hooks_self.current_pass is None or hooks_self.current_pass == 0)
+            )
+            if not capture_attn:
                 return original_forward(
                     hidden_states,
                     attention_mask=attention_mask,
@@ -353,24 +499,38 @@ class ProbeHooks:
                 h = outputs[0]
             else:
                 h = outputs
-            # h: [1, S, d_model]
-            masked_pos = self.masked_positions
-            h_at_m = h[0, masked_pos, :].to(torch.float16).cpu()
-            buf = self._buffers[self.current_block]
-            buf.h.append(h_at_m)
+            # h: [1, S, d_model] at pass 0; [1, block_length, d_model] at pass ≥ 1
+            indices = self.current_indices if self.current_indices is not None else self.masked_positions
+            h_at_m = h[0, indices, :].to(torch.float16).cpu()
+
+            # Legacy buffer: only at pass 0 (or when set_pass was never called).
+            if self.current_pass is None or self.current_pass == 0:
+                self._buffers[self.current_block].h.append(h_at_m)
+
+            # Intra-block buffer: every pass.
+            if self.intra_block and self.current_pass is not None:
+                pass_buf = self._intra_buffers[self.current_block].get(self.current_pass)
+                if pass_buf is not None:
+                    pass_buf.h.append(h_at_m)
         return hook
 
     def _make_embed_hook(self):
         def hook(module, inputs, outputs):
             if not self.armed or self.current_block is None:
                 return
-            # outputs: [1, S, d_model]
-            masked_pos = self.masked_positions
-            h_at_m = outputs[0, masked_pos, :].to(torch.float16).cpu()
-            buf = self._buffers[self.current_block]
-            # Insert at index 0 so it represents ℓ=0 (input embedding)
-            if len(buf.h) == 0 or len(buf.h) > 0 and buf.h[0].shape != h_at_m.shape:
+            # outputs: [1, S, d_model] at pass 0; [1, block_length, d_model] at pass ≥ 1
+            indices = self.current_indices if self.current_indices is not None else self.masked_positions
+            h_at_m = outputs[0, indices, :].to(torch.float16).cpu()
+
+            # Legacy buffer: only at pass 0.
+            if self.current_pass is None or self.current_pass == 0:
+                buf = self._buffers[self.current_block]
+                # Insert at index 0 so it represents ℓ=0 (input embedding)
                 buf.h.insert(0, h_at_m)
-            else:
-                buf.h.insert(0, h_at_m)
+
+            # Intra-block buffer: prepend embed for every pass.
+            if self.intra_block and self.current_pass is not None:
+                pass_buf = self._intra_buffers[self.current_block].get(self.current_pass)
+                if pass_buf is not None:
+                    pass_buf.h.insert(0, h_at_m)
         return hook

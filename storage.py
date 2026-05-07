@@ -52,11 +52,18 @@ def write_h5(
     attention_sink_positions: list[int] | None = None,
     special_token_positions: list[int] | None = None,
     eos_pos_in_generated: int | None = None,
+    intra_block_per_block: dict[int, dict[str, torch.Tensor]] | None = None,
 ) -> None:
     """Write one sample's probe data to HDF5.
 
     `data_per_block` maps block_idx → {"attn": Tensor, "v_norm": Tensor | None, "h_masked": Tensor}.
     `v_norm` may be None for blocks where it was not recorded (per `v_norm_blocks` config).
+
+    `intra_block_per_block` (optional) maps block_idx → {"h_per_pass":
+    [n_passes, L+1, num_masked, d_model], "token_state_per_pass":
+    [n_passes, num_masked], "revealed_per_pass": [n_passes, num_masked],
+    "pass_indices": [n_passes]}. When provided, written as additional
+    datasets under each block group; n_passes is per-block ragged.
     """
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -68,6 +75,15 @@ def write_h5(
             if tensors.get("v_norm") is not None:
                 grp.create_dataset("v_norm", data=_to_numpy(tensors["v_norm"]), compression="gzip", compression_opts=4)
             grp.create_dataset("h_masked", data=_to_numpy(tensors["h_masked"]), compression="gzip", compression_opts=4)
+            if intra_block_per_block and block_idx in intra_block_per_block:
+                ib = intra_block_per_block[block_idx]
+                grp.create_dataset("h_per_pass", data=_to_numpy(ib["h_per_pass"]),
+                                   compression="gzip", compression_opts=4)
+                grp.create_dataset("token_state_per_pass", data=_to_numpy(ib["token_state_per_pass"]),
+                                   compression="gzip", compression_opts=4)
+                grp.create_dataset("revealed_per_pass", data=_to_numpy(ib["revealed_per_pass"]),
+                                   compression="gzip", compression_opts=4)
+                grp.create_dataset("pass_indices", data=_to_numpy(ib["pass_indices"]))
 
         f.attrs["prompt_len"] = int(prompt_len)
         f.attrs["num_masked"] = int(num_masked)
@@ -109,6 +125,9 @@ def read_h5(path: str | Path) -> dict[str, Any]:
             if "v_norm" in grp:
                 block_data["v_norm"] = np.asarray(grp["v_norm"])
             block_data["h_masked"] = np.asarray(grp["h_masked"])
+            for name in ("h_per_pass", "token_state_per_pass", "revealed_per_pass", "pass_indices"):
+                if name in grp:
+                    block_data[name] = np.asarray(grp[name])
             out["blocks"][block_idx] = block_data
     return out
 

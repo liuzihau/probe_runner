@@ -93,7 +93,8 @@ def _check_first_block_sanity(buf_data: dict, prompt_len: int, num_blocks: int, 
 def run_for_model(model_type: str, *, n_samples: int = 100, output_root: Path | None = None,
                   max_prompt_tokens: int = 512, gen_length: int = 256, block_length: int = 32,
                   steps: int = 256, threshold: float = 0.9,
-                  fast_dllm_path: str | Path | None = None) -> dict:
+                  fast_dllm_path: str | Path | None = None,
+                  intra_block: bool = False) -> dict:
     output_root = output_root or Path(configs.PROBE_CONFIG["output"]["root"])
     out_dir = output_root / model_type
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -173,6 +174,7 @@ def run_for_model(model_type: str, *, n_samples: int = 100, output_root: Path | 
             n_heads=dims["n_heads"],
             d_head=dims["d_head"],
             record_v_norm=True,  # we toggle per-block via a wrapper below
+            intra_block=intra_block,
         )
 
         def on_block_start(block_idx: int, masked_positions_abs: list[int]):
@@ -186,36 +188,50 @@ def run_for_model(model_type: str, *, n_samples: int = 100, output_root: Path | 
         def on_block_end(block_idx: int):
             hooks.armed = False
 
+        def on_pass_start(block_idx: int, pass_idx: int, token_state, indices_in_forward):
+            if block_idx not in record_blocks_set:
+                return
+            hooks.set_pass(
+                block_idx, pass_idx,
+                token_state=token_state,
+                indices=indices_in_forward,
+            )
+            hooks.armed = True
+
+        def on_pass_end(block_idx: int, pass_idx: int, revealed_this_pass):
+            if block_idx not in record_blocks_set:
+                return
+            hooks.finalize_pass(revealed_this_pass=revealed_this_pass)
+            hooks.armed = False
+
         try:
             t0 = time.time()
             with torch.inference_mode():
-                output_ids, nfe = generate_with_probes(
-                    model,
-                    prompt_ids,
+                gen_kwargs = dict(
                     on_block_start=on_block_start,
                     on_block_end=on_block_end,
-                    mask_token_id=mask_token_id,
+                    on_pass_start=on_pass_start,
+                    on_pass_end=on_pass_end,
+                    intra_block=intra_block,
                     steps=steps,
                     gen_length=gen_length,
                     block_length=block_length,
                     threshold=threshold,
                     temperature=0.0,
-                ) if model_type == "dream" else generate_with_probes(
-                    model,
-                    prompt_ids,
-                    on_block_start=on_block_start,
-                    on_block_end=on_block_end,
-                    steps=steps,
-                    gen_length=gen_length,
-                    block_length=block_length,
-                    threshold=threshold,
-                    temperature=0.0,
-                    mask_id=mask_token_id,
                 )
+                if model_type == "dream":
+                    output_ids, nfe = generate_with_probes(
+                        model, prompt_ids, mask_token_id=mask_token_id, **gen_kwargs,
+                    )
+                else:
+                    output_ids, nfe = generate_with_probes(
+                        model, prompt_ids, mask_id=mask_token_id, **gen_kwargs,
+                    )
             dt = time.time() - t0
             sample_runtimes.append(dt)
 
             data_per_block = hooks.collect()
+            intra_block_per_block = hooks.collect_intra_block() if intra_block else None
             generated_ids = output_ids[0, prompt_ids.shape[1]:].tolist()
             generated_text = tokenizer.decode(generated_ids, skip_special_tokens=True)
 
@@ -256,6 +272,7 @@ def run_for_model(model_type: str, *, n_samples: int = 100, output_root: Path | 
                 attention_sink_positions=[0],  # default — refined by sanity check
                 special_token_positions=special_token_positions,
                 eos_pos_in_generated=eos_pos_in_generated,
+                intra_block_per_block=intra_block_per_block,
             )
 
             if sample_idx == 0:
@@ -310,6 +327,14 @@ def main():
         help="Path to Fast-dLLM v1 (the dir that contains llada/ and dream/). "
              "Defaults to env FAST_DLLM_V1_PATH or ./external/Fast-dLLM/v1.",
     )
+    parser.add_argument(
+        "--intra_block",
+        action="store_true",
+        help="Record per-pass hidden states within each block (in addition to "
+             "the existing pass-0 attn / v_norm / h_masked). Adds ~470 MB per "
+             "sample of fp16 h_per_pass; needed for the intra-block drift / "
+             "diff-heatmap analyses.",
+    )
     args = parser.parse_args()
 
     # Validate Fast-dLLM is reachable BEFORE we start loading large models.
@@ -327,6 +352,7 @@ def main():
             n_samples=args.n_samples,
             output_root=output_root,
             fast_dllm_path=args.fast_dllm_path,
+            intra_block=args.intra_block,
         )
 
     write_meta(summaries, output_root)

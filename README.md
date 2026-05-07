@@ -273,7 +273,27 @@ python -m probe_runner.run_probes --model {llada,dream,both}
                                   [--n_samples N]
                                   [--output_root probes_out]
                                   [--fast_dllm_path /path/to/Fast-dLLM/v1]
+                                  [--intra_block]
 ```
+
+`--intra_block` (LLaDA only for now) keeps the probe hooks armed across
+*every* parallel-decode pass within a block, recording per-pass hidden
+states for all 32 block positions (in addition to the existing pass-0
+attn / v_norm / h_masked). Adds ~470 MB per sample of fp16 `h_per_pass`,
+so a full 100-sample run jumps from ~43 GB to ~90 GB. Used by:
+
+```
+python -m probe_runner.plots.plot_intra_block --model llada --variant drift_grouped
+python -m probe_runner.plots.plot_intra_block --model llada --variant diff_heatmap
+python -m probe_runner.plots.plot_intra_block --model llada --variant all
+```
+
+`drift_grouped` (Analysis A) plots mean L2 hidden-state drift between
+consecutive passes, partitioned into MM (mask→mask), MC (mask→clean), CC
+(clean→clean) groups, faceted by block. `diff_heatmap` (Analysis B)
+plots a per-block (decode_pass × position) heatmap of mean-over-layers
+L2 diff, with a `×` marker overlay on cells where the position was
+revealed during that pass-to-pass transition.
 
 ```
 python -m probe_runner.plots.plot_info_flow_to_prefix --model {llada,dream}

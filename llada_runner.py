@@ -117,6 +117,9 @@ def generate_with_probes(
     *,
     on_block_start,
     on_block_end,
+    on_pass_start=None,
+    on_pass_end=None,
+    intra_block: bool = False,
     steps: int = 256,
     gen_length: int = 256,
     block_length: int = 32,
@@ -127,9 +130,23 @@ def generate_with_probes(
 ):
     """Mirror of `generate_with_dual_cache` from Fast-dLLM v1, with probe callbacks.
 
-    Callbacks:
-        on_block_start(block_idx, masked_positions_abs)  — called *before* the block's first forward.
-        on_block_end(block_idx)                          — called *after* the block's first forward.
+    Block-level callbacks (always called):
+        on_block_start(block_idx, masked_positions_abs)  — before the block's first forward.
+        on_block_end(block_idx)                          — after the block's last forward.
+
+    Per-pass callbacks (intra_block=True only — fired around every forward):
+        on_pass_start(block_idx, pass_idx, token_state_pre, indices_in_forward)
+            token_state_pre: int8 [block_length] — 0=mask, 1=clean at pass start.
+            indices_in_forward: list[int] — positions of the forward's hidden-
+                state tensor to record at. Absolute (s..e) at pass 0 (full
+                sequence), local (0..block_length) at pass ≥ 1 (block-only).
+        on_pass_end(block_idx, pass_idx, revealed_this_pass)
+            revealed_this_pass: bool [block_length] — positions revealed by this pass.
+
+    In legacy mode (`intra_block=False`) on_block_end fires immediately after
+    the block's first forward (matching the old contract). In intra-block
+    mode it fires *after the last pass of the block* — same total firings,
+    but now the inner-loop forwards are also armed.
 
     Returns (x, nfe).
     """
@@ -152,47 +169,76 @@ def generate_with_probes(
         block_mask_index = (x[:, s:e] == mask_id)
         num_transfer_tokens = _get_num_transfer_tokens(block_mask_index, steps_per_block)
 
-        # ---- ARM HOOKS for the first forward of this block ----
         masked_positions_abs = list(range(s, e))
         on_block_start(nb, masked_positions_abs)
 
-        out_full = model(x, use_cache=True)
-        past_key_values = out_full.past_key_values
-
-        on_block_end(nb)
-        # ----
-
-        nfe += 1
-
         replace_position = torch.zeros_like(x, dtype=torch.bool)
         replace_position[:, s:e] = True
+        past_key_values = None
 
-        global_mask_index = (x == mask_id)
-        global_mask_index[:, e:] = False
-
-        quota0 = None if threshold is not None else num_transfer_tokens[:, 0]
-        x0, transfer_index = _get_transfer_index(
-            out_full.logits, temperature, remasking, global_mask_index, x, quota0, threshold
-        )
-        x = torch.where(transfer_index, x0, x)
-
-        for i in range(1, steps_per_block):
-            if (x[:, s:e] == mask_id).sum() == 0:
+        for i in range(steps_per_block):
+            # Block fully decoded — early exit. Also true at the top of the
+            # very first iter of pass 0 only when block_length == 0.
+            if i > 0 and (x[:, s:e] == mask_id).sum() == 0:
                 break
-            logits_blk = model(
-                x[:, s:e],
-                past_key_values=past_key_values,
-                use_cache=True,
-                replace_position=replace_position,
-            ).logits
-            mask_blk = (x[:, s:e] == mask_id)
-            quota_i = None if threshold is not None else num_transfer_tokens[:, i]
-            x0_blk, transfer_idx_blk = _get_transfer_index(
-                logits_blk, temperature, remasking, mask_blk, x[:, s:e], quota_i, threshold
-            )
-            blk_old = x[:, s:e]
-            blk_new = torch.where(transfer_idx_blk, x0_blk, blk_old)
-            x = torch.cat([x[:, :s], blk_new, x[:, e:]], dim=1)
+
+            # Per-pass start callback (intra-block mode only).
+            if intra_block and on_pass_start is not None:
+                pre_state = (x[0, s:e] != mask_id).to(torch.int8)
+                # Pass 0: model sees full x → absolute positions [s, e).
+                # Pass ≥ 1: model sees x[:, s:e] → local positions [0, B).
+                indices_in_forward = (
+                    list(range(s, e)) if i == 0 else list(range(block_length))
+                )
+                on_pass_start(nb, i, pre_state, indices_in_forward)
+
+            # In legacy mode, only pass 0 is armed; the runner relies on
+            # on_block_start having armed and on_block_end about to disarm.
+            # In intra-block mode every pass is armed and the (un)arming is
+            # done by the per-pass callbacks instead.
+
+            if i == 0:
+                out_full = model(x, use_cache=True)
+                past_key_values = out_full.past_key_values
+                if not intra_block:
+                    # Legacy contract: disarm right after the first forward.
+                    on_block_end(nb)
+
+                global_mask_index = (x == mask_id)
+                global_mask_index[:, e:] = False
+                quota_i = None if threshold is not None else num_transfer_tokens[:, 0]
+                x0, transfer_index = _get_transfer_index(
+                    out_full.logits, temperature, remasking, global_mask_index, x, quota_i, threshold,
+                )
+                new_x = torch.where(transfer_index, x0, x)
+                revealed_blk = transfer_index[0, s:e].to(torch.bool)
+                x = new_x
+            else:
+                logits_blk = model(
+                    x[:, s:e],
+                    past_key_values=past_key_values,
+                    use_cache=True,
+                    replace_position=replace_position,
+                ).logits
+                mask_blk = (x[:, s:e] == mask_id)
+                quota_i = None if threshold is not None else num_transfer_tokens[:, i]
+                x0_blk, transfer_idx_blk = _get_transfer_index(
+                    logits_blk, temperature, remasking, mask_blk, x[:, s:e], quota_i, threshold,
+                )
+                blk_old = x[:, s:e]
+                blk_new = torch.where(transfer_idx_blk, x0_blk, blk_old)
+                x = torch.cat([x[:, :s], blk_new, x[:, e:]], dim=1)
+                revealed_blk = transfer_idx_blk[0].to(torch.bool)
+
             nfe += 1
+
+            if intra_block and on_pass_end is not None:
+                on_pass_end(nb, i, revealed_blk)
+
+        # In intra-block mode the block-end callback fires after the inner
+        # loop finishes (or breaks out early). In legacy mode it already
+        # fired right after pass 0.
+        if intra_block:
+            on_block_end(nb)
 
     return x, nfe

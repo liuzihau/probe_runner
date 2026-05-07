@@ -88,6 +88,9 @@ def generate_with_probes(
     *,
     on_block_start,
     on_block_end,
+    on_pass_start=None,
+    on_pass_end=None,
+    intra_block: bool = False,
     mask_token_id: int,
     steps: int = 256,
     gen_length: int = 256,
@@ -97,7 +100,19 @@ def generate_with_probes(
     top_p: Optional[float] = None,
     top_k: Optional[int] = None,
 ):
-    """Run Dream block-diffusion generation with arm/disarm callbacks at each block's first forward."""
+    """Run Dream block-diffusion generation with arm/disarm callbacks at each block's first forward.
+
+    Note: `intra_block=True` is not yet implemented for Dream. The kwarg is
+    accepted so the same call site works for both runners, but enabling it
+    raises. Restructure the inner loop the same way as `llada_runner.py` if
+    you need it.
+    """
+    if intra_block:
+        raise NotImplementedError(
+            "intra_block=True is not implemented for Dream yet. Run with --model llada, "
+            "or port the per-pass loop from llada_runner.py."
+        )
+    del on_pass_start, on_pass_end  # unused in legacy path
     B = prompt.shape[0]
     Lp = int(prompt.shape[1])
     max_length = Lp + gen_length
