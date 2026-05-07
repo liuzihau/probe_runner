@@ -187,24 +187,63 @@ def _y_label(metric: str) -> str:
 
 # --- Analysis B: per-sample diff heatmaps -------------------------------------
 
-def _per_sample_iter(probes_root: Path, model: str, n_samples: int):
-    """Yield (sample_id, per_block_data) for the first n_samples that have
-    intra-block data. per_block_data: block_idx → {h_per_pass, revealed_per_pass}."""
-    yielded = 0
+def _collect_samples_for_heatmap(probes_root: Path, model: str, metric: str,
+                                  n_samples: int) -> list[tuple[str, dict]]:
+    """Eagerly load + pre-compute heatmap cells for the first n_samples that
+    have intra-block data. Returns [(sample_id, {block_idx: {cell, revealed,
+    n_passes}}), ...]. Done in one pass so we can compute the *shared*
+    vmin/vmax across all samples for stable cross-sample colour comparison.
+    """
+    out: list[tuple[str, dict]] = []
     for path in _iter_sample_paths(probes_root, model):
         per_block = _load_intra_block(path)
         if not per_block:
             continue
-        yield path.stem, per_block
-        yielded += 1
-        if yielded >= n_samples:
-            return
+        sample_data: dict[int, dict] = {}
+        for block_idx, data in per_block.items():
+            h = data["h_per_pass"]
+            rv = data["revealed_per_pass"].astype(bool)
+            if h.shape[0] < 2:
+                continue
+            diffs = _compute_diffs(h, metric)        # [P-1, L+1, M]
+            cell = diffs.mean(axis=1)                # [P-1, M]
+            sample_data[block_idx] = {
+                "cell":     cell,
+                "revealed": rv[:-1],
+                "n_passes": int(h.shape[0]),
+            }
+        if sample_data:
+            out.append((path.stem, sample_data))
+        if len(out) >= n_samples:
+            break
+    return out
 
 
-def _plot_diff_heatmap_one(per_block: dict, out_path: Path,
-                           model: str, metric: str, sample_id: str) -> None:
+def _global_vrange(samples: list[tuple[str, dict]]) -> tuple[float, float]:
+    """Min/max across all (sample, block, pass-pair, position) cells. Used
+    so all per-sample heatmaps share a colorbar — different samples decode
+    in different orders, so without a fixed scale you can't visually
+    compare drift magnitudes across samples.
+    """
+    lo = np.inf
+    hi = -np.inf
+    for _, blocks in samples:
+        for _, d in blocks.items():
+            cell = d["cell"]
+            lo = min(lo, float(np.nanmin(cell)))
+            hi = max(hi, float(np.nanmax(cell)))
+    if not np.isfinite(lo) or not np.isfinite(hi):
+        return 0.0, 1.0
+    if hi == lo:
+        hi = lo + 1e-8
+    return lo, hi
+
+
+def _plot_diff_heatmap_one(sample_data: dict, out_path: Path,
+                           model: str, metric: str, sample_id: str,
+                           vmin: float, vmax: float) -> None:
     import matplotlib.pyplot as plt
-    blocks = sorted(per_block.keys())
+    blocks = sorted(sample_data.keys())
     n_blocks = len(blocks)
     ncols = min(2, n_blocks)
     nrows = int(np.ceil(n_blocks / ncols))
@@ -221,32 +260,28 @@ def _plot_diff_heatmap_one(per_block: dict, out_path: Path,
 
     for ax_i, block_idx in enumerate(blocks):
         ax = axes[ax_i // ncols][ax_i % ncols]
-        data = per_block[block_idx]
-        h = data["h_per_pass"]
-        rv = data["revealed_per_pass"].astype(bool)
-        if h.shape[0] < 2:
-            ax.set_visible(False)
-            continue
-        diffs = _compute_diffs(h, metric)        # [P-1, L+1, M]
-        cell = diffs.mean(axis=1)                # [P-1, M]
-        revealed = rv[:-1]                       # [P-1, M]
+        d = sample_data[block_idx]
+        cell, revealed, n_passes = d["cell"], d["revealed"], d["n_passes"]
         im = ax.imshow(cell, aspect="auto", origin="lower",
-                       interpolation="nearest", cmap=cmap)
+                       interpolation="nearest", cmap=cmap,
+                       vmin=vmin, vmax=vmax)
         ys, xs = np.where(revealed)
         ax.scatter(xs, ys, marker="x", s=14, c="white", linewidths=0.7)
-        ax.set_title(f"block {block_idx}  (n_passes={h.shape[0]})")
+        ax.set_title(f"block {block_idx}  (n_passes={n_passes})")
         ax.set_xlabel("position in block")
         ax.set_ylabel("decode pass i (i → i+1)")
         fig.colorbar(im, ax=ax, label=cbar_label)
 
-    # Hide any unused subplots.
     for j in range(n_blocks, nrows * ncols):
         axes[j // ncols][j % ncols].set_visible(False)
 
     direction = "(× = revealed during transition; higher = more drift)" \
                 if _is_drift_metric(metric) \
                 else "(× = revealed during transition; higher = more similar)"
-    fig.suptitle(f"{model} {sample_id}: intra-block {metric} heatmap  {direction}")
+    fig.suptitle(
+        f"{model} {sample_id}: intra-block {metric} heatmap  {direction}\n"
+        f"shared scale [vmin={vmin:.3g}, vmax={vmax:.3g}] across all sampled plots"
+    )
     fig.tight_layout()
     fig.savefig(out_path, dpi=130, bbox_inches="tight")
     plt.close(fig)
@@ -285,14 +320,17 @@ def main() -> None:
                 _plot_drift_grouped(stats, out, args.model, metric)
 
         if do_heatmap:
-            count = 0
-            for sample_id, per_block in _per_sample_iter(
-                    args.probes_root, args.model, args.n_samples_heatmap):
-                out = out_dir / f"intra_block_diff_heatmap_{metric}_{sample_id}.png"
-                _plot_diff_heatmap_one(per_block, out, args.model, metric, sample_id)
-                count += 1
-            if count == 0:
+            samples = _collect_samples_for_heatmap(
+                args.probes_root, args.model, metric, args.n_samples_heatmap,
+            )
+            if not samples:
                 print(f"WARN: no intra_block samples found for diff_heatmap/{metric}.")
+                continue
+            vmin, vmax = _global_vrange(samples)
+            for sample_id, per_block in samples:
+                out = out_dir / f"intra_block_diff_heatmap_{metric}_{sample_id}.png"
+                _plot_diff_heatmap_one(per_block, out, args.model, metric,
+                                       sample_id, vmin, vmax)
 
 
 if __name__ == "__main__":
