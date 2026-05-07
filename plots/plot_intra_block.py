@@ -153,7 +153,12 @@ def _plot_drift_grouped(stats: dict, out_path: Path, model: str, metric: str) ->
     nrows = int(np.ceil(n_blocks / ncols))
     fig, axes = plt.subplots(nrows, ncols, figsize=(4 * ncols, 3 * nrows),
                              squeeze=False, sharey=True)
-    layer_idx = np.arange(n_layers_p1)
+
+    # Skip layer 0 (input embedding) — it's a degenerate token-id-only
+    # readout that swamps the y-axis for MC and tells us nothing about
+    # the model's contextual processing. Plot layers 1..L only, with
+    # x-axis labelled by the original layer index.
+    plot_layers = np.arange(1, n_layers_p1)
 
     colors = {"MM": "tab:gray", "MC": "tab:red", "CC": "tab:blue"}
     for ax_i, block_idx in enumerate(blocks):
@@ -162,15 +167,21 @@ def _plot_drift_grouped(stats: dict, out_path: Path, model: str, metric: str) ->
         with np.errstate(invalid="ignore"):
             mean = np.where(c > 0, s / np.maximum(c, 1), np.nan)
         for slot, label in enumerate(("MM", "MC", "CC")):
-            ax.plot(layer_idx, mean[slot], label=label, color=colors[label], lw=1.5)
+            ax.plot(plot_layers, mean[slot, 1:], label=label, color=colors[label], lw=1.5)
+        # Cosine-similarity reference line: 0.95 is the conventional CKA-style
+        # "effectively equivalent representations" threshold (Kornblith et al.
+        # 2019). Drop on cosine plots only — meaningless for L2-style metrics.
+        if metric == "cosine_sim":
+            ax.axhline(0.95, ls="--", color="black", alpha=0.45, lw=1.0,
+                       label="0.95 (≈equivalent)")
         ax.set_title(f"block {block_idx}")
-        ax.set_xlabel("layer")
+        ax.set_xlabel("layer (1 = first transformer block; embed layer 0 omitted)")
         ax.grid(alpha=0.3)
     axes[0][0].set_ylabel(_y_label(metric))
-    axes[0][0].legend(loc="upper left", fontsize=8)
+    axes[0][0].legend(loc="best", fontsize=8)
     direction = "drift (higher = more change)" if _is_drift_metric(metric) else "similarity (higher = more aligned)"
     fig.suptitle(f"{model}: intra-block hidden-state {metric} grouped by token-state transition  "
-                 f"[{direction}, n_samples={stats['n_samples']}]")
+                 f"[{direction}, n_samples={stats['n_samples']}, layers 1+]")
     fig.tight_layout()
     fig.savefig(out_path, dpi=130, bbox_inches="tight")
     plt.close(fig)
@@ -193,6 +204,11 @@ def _collect_samples_for_heatmap(probes_root: Path, model: str, metric: str,
     have intra-block data. Returns [(sample_id, {block_idx: {cell, revealed,
     n_passes}}), ...]. Done in one pass so we can compute the *shared*
     vmin/vmax across all samples for stable cross-sample colour comparison.
+
+    Cell aggregation: mean over **layers 1..L** (transformer blocks only) —
+    layer 0 (input embedding) is omitted. The embed layer is a token-id
+    readout that swamps the average for MC positions without telling us
+    anything about contextual processing.
     """
     out: list[tuple[str, dict]] = []
     for path in _iter_sample_paths(probes_root, model):
@@ -206,7 +222,7 @@ def _collect_samples_for_heatmap(probes_root: Path, model: str, metric: str,
             if h.shape[0] < 2:
                 continue
             diffs = _compute_diffs(h, metric)        # [P-1, L+1, M]
-            cell = diffs.mean(axis=1)                # [P-1, M]
+            cell = diffs[:, 1:, :].mean(axis=1)      # [P-1, M] — skip layer 0 (embed)
             sample_data[block_idx] = {
                 "cell":     cell,
                 "revealed": rv[:-1],
@@ -265,21 +281,32 @@ def _plot_diff_heatmap_one(sample_data: dict, out_path: Path,
         im = ax.imshow(cell, aspect="auto", origin="lower",
                        interpolation="nearest", cmap=cmap,
                        vmin=vmin, vmax=vmax)
+        # Contour at cos = 0.95 (CKA-style "≈equivalent" threshold) for the
+        # cosine-similarity heatmap only.
+        if metric == "cosine_sim" and vmin <= 0.95 <= vmax:
+            try:
+                ax.contour(cell, levels=[0.95], colors="white",
+                           linestyles="dashed", linewidths=0.8)
+            except ValueError:
+                pass  # contour fails on degenerate inputs; skip silently.
         ys, xs = np.where(revealed)
         ax.scatter(xs, ys, marker="x", s=14, c="white", linewidths=0.7)
         ax.set_title(f"block {block_idx}  (n_passes={n_passes})")
         ax.set_xlabel("position in block")
         ax.set_ylabel("decode pass i (i → i+1)")
-        fig.colorbar(im, ax=ax, label=cbar_label)
+        cbar = fig.colorbar(im, ax=ax, label=cbar_label)
+        if metric == "cosine_sim" and vmin <= 0.95 <= vmax:
+            cbar.ax.axhline(0.95, color="white", linestyle="dashed", linewidth=0.8)
 
     for j in range(n_blocks, nrows * ncols):
         axes[j // ncols][j % ncols].set_visible(False)
 
     direction = "(× = revealed during transition; higher = more drift)" \
                 if _is_drift_metric(metric) \
-                else "(× = revealed during transition; higher = more similar)"
+                else "(× = revealed; higher = more similar; dashed contour at cos=0.95)"
     fig.suptitle(
-        f"{model} {sample_id}: intra-block {metric} heatmap  {direction}\n"
+        f"{model} {sample_id}: intra-block {metric} heatmap  "
+        f"[layer-mean over transformer blocks 1..L; embed layer 0 omitted]\n{direction}\n"
         f"shared scale [vmin={vmin:.3g}, vmax={vmax:.3g}] across all sampled plots"
     )
     fig.tight_layout()
