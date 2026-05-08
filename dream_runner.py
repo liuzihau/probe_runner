@@ -100,19 +100,35 @@ def generate_with_probes(
     top_p: Optional[float] = None,
     top_k: Optional[int] = None,
 ):
-    """Run Dream block-diffusion generation with arm/disarm callbacks at each block's first forward.
+    """Run Dream block-diffusion generation with probe callbacks.
 
-    Note: `intra_block=True` is not yet implemented for Dream. The kwarg is
-    accepted so the same call site works for both runners, but enabling it
-    raises. Restructure the inner loop the same way as `llada_runner.py` if
-    you need it.
+    Block-level callbacks (always called):
+        on_block_start(block_idx, masked_positions_abs)  — before the block's first forward.
+        on_block_end(block_idx)                          — after the block's last forward.
+
+    Per-pass callbacks (intra_block=True only — fired around every forward):
+        on_pass_start(block_idx, pass_idx, token_state_pre, indices_in_forward)
+            token_state_pre: int8 [block_length] — 0=mask, 1=clean at pass start.
+            indices_in_forward: list[int] — positions in the forward's hidden
+                state tensor to record at. Absolute (s..e) at pass 0
+                (full sequence), local (0..block_length) at pass ≥ 1
+                (block-only via x[:, s:e]).
+        on_pass_end(block_idx, pass_idx, revealed_this_pass)
+            revealed_this_pass: bool [block_length] — positions revealed by this pass.
+
+    Dream-specific quirks vs LLaDA:
+    - **Logit shift.** Output logits are rotated by one position
+      (`[logits[:, :1], logits[:, :-1]]`) — Dream's convention; see line
+      ~454 of upstream `_sample`.
+    - **Pass 0 reveals only position s.** The first forward computes
+      logits over the whole sequence, but only `x[:, s]` (the block's
+      first position) is sampled. Passes ≥ 1 do the parallel
+      confidence-thresholded reveal over remaining mask positions.
+    - **`dual_cache=True` + `replace_position`** at every block-only
+      forward (pass ≥ 1) — Fast-dLLM's specific cache update interface.
+
+    Returns (x, nfe).
     """
-    if intra_block:
-        raise NotImplementedError(
-            "intra_block=True is not implemented for Dream yet. Run with --model llada, "
-            "or port the per-pass loop from llada_runner.py."
-        )
-    del on_pass_start, on_pass_end  # unused in legacy path
     B = prompt.shape[0]
     Lp = int(prompt.shape[1])
     max_length = Lp + gen_length
@@ -134,32 +150,55 @@ def generate_with_probes(
     for nb in range(num_blocks):
         s = Lp + nb * block_length
         e = s + block_length
-
         masked_positions_abs = list(range(s, e))
 
-        # ---- ARM HOOKS ----
         on_block_start(nb, masked_positions_abs)
 
+        # ---- Pass 0: full-sequence prefill, samples only position s ----
+        if intra_block and on_pass_start is not None:
+            pre_state = (x[0, s:e] != mask_token_id).to(torch.int8)
+            on_pass_start(nb, 0, pre_state, list(range(s, e)))
+
         out = model(x, attention_mask, tok_idx, use_cache=True)
-
-        on_block_end(nb)
-        # ----
-
         nfe += 1
         past_key_values = out.past_key_values
         logits = out.logits
-        # Dream's convention: shift logits by 1 position (line 454 of upstream)
         logits = torch.cat([logits[:, :1], logits[:, :-1]], dim=1)
         confidence, x0 = _sample_tokens(logits, temperature=temperature, top_p=top_p, top_k=top_k)
+
+        was_mask_at_s = (x[0, s] == mask_token_id).item()
         x[:, s] = x0[:, s]
+        revealed_p0 = torch.zeros(block_length, dtype=torch.bool, device=x.device)
+        if was_mask_at_s and (x[0, s] != mask_token_id).item():
+            revealed_p0[0] = True   # position s = local index 0 in [s..e)
+
+        if intra_block:
+            if on_pass_end is not None:
+                on_pass_end(nb, 0, revealed_p0)
+        else:
+            # Legacy contract: disarm right after the first forward.
+            on_block_end(nb)
 
         replace_position = torch.zeros_like(x, dtype=torch.bool)
         replace_position[:, s:e] = True
 
+        # ---- Passes ≥ 1: block-only forwards with cache + replace_position ----
         i = 1
         while True:
+            if i >= steps_per_block:
+                break
+            if (x[:, s:e] == mask_token_id).sum() == 0:
+                break
+
+            if intra_block and on_pass_start is not None:
+                pre_state = (x[0, s:e] != mask_token_id).to(torch.int8)
+                on_pass_start(nb, i, pre_state, list(range(block_length)))
+
             mask_index = (x[:, s:e] == mask_token_id)
-            current_attention_mask = attention_mask if attention_mask == "full" else attention_mask[:, :, :, s:]
+            current_attention_mask = (
+                attention_mask if attention_mask == "full"
+                else attention_mask[:, :, :, s:]
+            )
             out = model(
                 x[:, s:e],
                 current_attention_mask,
@@ -172,17 +211,18 @@ def generate_with_probes(
             logits = out.logits
             logits = torch.cat([logits[:, :1], logits[:, :-1]], dim=1)
             mask_logits = logits[mask_index]
-            confidence, x0 = _sample_tokens(mask_logits, temperature=temperature, top_p=top_p, top_k=top_k)
+            confidence, x0 = _sample_tokens(
+                mask_logits, temperature=temperature, top_p=top_p, top_k=top_k,
+            )
 
             x_ = torch.full_like(x[:, s:e], mask_token_id, device=model.device, dtype=torch.long)
-            full_confidence = torch.full_like(x[:, s:e], -float("inf"), device=model.device, dtype=logits.dtype)
+            full_confidence = torch.full_like(
+                x[:, s:e], -float("inf"), device=model.device, dtype=logits.dtype,
+            )
             x_[mask_index] = x0.clone()
             full_confidence[mask_index] = confidence
 
             current_transfer_tokens = int((x[:, s:e] == mask_token_id).sum().item())
-            if current_transfer_tokens == 0:
-                break
-
             selected_confidence, select_index = torch.topk(full_confidence, current_transfer_tokens)
             transfer_index = torch.zeros_like(x_, dtype=torch.bool)
             transfer_index[0, select_index[0]] = True
@@ -191,11 +231,15 @@ def generate_with_probes(
                     transfer_index[0, select_index[0, k]] = False
 
             x[:, s:e][transfer_index] = x_[transfer_index]
+            revealed_blk = transfer_index[0].to(torch.bool)
             nfe += 1
+
+            if intra_block and on_pass_end is not None:
+                on_pass_end(nb, i, revealed_blk)
+
             i += 1
-            if i >= steps_per_block:
-                break
-            if (x[:, s:e] == mask_token_id).sum() == 0:
-                break
+
+        if intra_block:
+            on_block_end(nb)
 
     return x, nfe

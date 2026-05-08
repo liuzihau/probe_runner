@@ -68,9 +68,10 @@ python -m probe_runner.run_probes --model llada --n_samples 2
 # 4. Full legacy capture (100 samples, both models).
 python -m probe_runner.run_probes --model both
 
-# 5. Intra-block per-pass capture (LLaDA only for now). Adds ~470 MB / sample
-#    of fp16 h_per_pass; needed for the intra-block analyses.
+# 5. Intra-block per-pass capture. Adds ~470 MB / sample of fp16 h_per_pass;
+#    needed for the intra-block analyses. Supported for both LLaDA and Dream.
 python -m probe_runner.run_probes --model llada --intra_block
+python -m probe_runner.run_probes --model dream --intra_block
 
 # 6. Plots — see "Analyses" section below for what each command produces.
 python -m probe_runner.plots.plot_info_flow_to_prefix --model llada
@@ -159,7 +160,7 @@ python -m probe_runner.run_probes
     [--n_samples N]                     # default 100 (set in configs.py)
     [--output_root probes_out]
     [--fast_dllm_path /path/to/Fast-dLLM/v1]
-    [--intra_block]                     # LLaDA only; adds per-pass capture
+    [--intra_block]                     # adds per-pass capture (both LLaDA and Dream)
 ```
 
 Existing samples in the output dir are skipped (so you can resume
@@ -528,8 +529,9 @@ probe_runner/
 │                                         legacy (pass-0 only) and intra_block (every pass)
 ├── llada_runner.py                       LLaDA generation with Fast-dLLM v1 dual-cache;
 │                                         on_block_start / on_pass_start callbacks
-├── dream_runner.py                       same protocol on Dream (intra_block deferred —
-│                                         raises NotImplementedError if requested)
+├── dream_runner.py                       same protocol on Dream (intra_block supported;
+│                                         pass-0 reveals only position s, passes ≥ 1 use
+│                                         dual_cache + replace_position)
 ├── run_probes.py                         CLI entry: drives capture, writes HDF5 + meta.json
 └── plots/
     ├── __init__.py
@@ -572,9 +574,15 @@ external/Fast-dLLM/                       fetched by setup.sh, NOT bundled
   `model/modeling_dream.py` provides the `dual_cache + replace_position`
   interface. If Fast-dLLM upstream changes that interface,
   `dream_runner.py` may need a small alignment patch.
-- **Dream `--intra_block` not implemented.** `run_probes.py` will
-  raise `NotImplementedError` immediately if you ask for it. Port
-  the per-pass loop from `llada_runner.py` if needed.
+- **Dream `--intra_block` is implemented but lightly tested.** The
+  per-pass loop mirrors the LLaDA one with two adaptations: pass 0
+  only samples position `s` (block-start) — Dream's convention — so
+  the recorded `revealed_per_pass[0]` for a Dream block has at most
+  one True entry (at local index 0). Passes ≥ 1 are the standard
+  parallel-confidence-thresholded reveal under `dual_cache=True` +
+  `replace_position`. Hidden states at every pass are captured at
+  all 32 block positions, same as LLaDA. Cross-check sanity-sample-0
+  output before relying on bulk Dream intra-block runs.
 - **Attention-sink subtraction is heuristic.** Default
   `attention_sink_positions=[0]`. If sample-0 sanity shows
   `mean_attn_to_pos0 < 0.1`, manually edit `meta.json` to update the
