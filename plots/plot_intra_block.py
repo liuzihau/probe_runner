@@ -642,6 +642,160 @@ def _plot_prediction_overlap(stats: dict, out_path: Path, model_name: str) -> No
     print(f"saved {out_path}")
 
 
+# --- Analysis E: layered per-(sample, block) heatmaps vs pass 0 --------------
+#
+# Per (sample, block), a 3×2 grid of heatmaps:
+#   panels 1..5 — cos_sim(h[i, layer, p], h[0, layer, p]) for selected layers,
+#                  default 1, 8, 16, 24, 32 (LLaDA-32 quantiles).
+#   panel 6 — shared_mass(p_i, p_0) at the LM head, computed via
+#              softmax(lm_head(final_norm(h[*, -1, :, :]))) for each pass.
+# y-axis = iteration i (vs pass 0); x-axis = position in block;
+# × overlay = position revealed at some pass ≤ i.
+#
+# Loads the model (for shared mass). Heavy; not part of --variant all.
+
+
+def _layered_heatmap_payload(
+    h_per_pass: np.ndarray,
+    ts: np.ndarray,
+    layers_to_plot: list[int],
+    p_all: torch.Tensor,         # [P, M, V]
+) -> dict:
+    """Compute the per-(sample, block) data needed for the layered heatmap."""
+    P, Lp1, M, _ = h_per_pass.shape
+    h = h_per_pass.astype(np.float32, copy=False)
+    h0 = h[0:1]                                  # [1, L+1, M, D]
+    rest = h[1:]                                 # [P-1, L+1, M, D]
+    dot = (rest * h0).sum(axis=-1)               # [P-1, L+1, M]
+    nr = np.linalg.norm(rest, axis=-1)
+    n0 = np.linalg.norm(h0, axis=-1)
+    cos_full = dot / np.maximum(nr * n0, 1e-8)   # [P-1, L+1, M]
+
+    layer_diffs: dict[int, np.ndarray] = {}
+    for layer in layers_to_plot:
+        if 0 <= layer < Lp1:
+            layer_diffs[layer] = cos_full[:, layer, :]   # [P-1, M]
+
+    # Shared mass at LM head: panel 6.
+    p0 = p_all[0:1]                              # [1, M, V]
+    sm = torch.minimum(p_all[1:], p0).sum(dim=-1)  # [P-1, M]
+    shared_mass = sm.cpu().numpy()
+
+    revealed_so_far = (ts[1:].astype(np.int8) == 1)   # [P-1, M] — clean at pass i
+
+    return {
+        "layer_diffs":     layer_diffs,
+        "shared_mass":     shared_mass,
+        "revealed_so_far": revealed_so_far,
+        "n_passes":        int(P),
+    }
+
+
+def _accumulate_layered_heatmaps(
+    probes_root: Path, model_type: str, fast_dllm_path: str | None,
+    *, blocks_to_use: list[int], n_samples: int, layers_to_plot: list[int],
+):
+    """Generator: yield (sample_id, block_idx, payload) for the first n_samples
+    that have intra-block data. Loads model + final_norm + lm_head once."""
+    import torch
+    import torch.nn.functional as F
+    from probe_runner.plots.plot_logit_lens import _load_model_components
+
+    print(f"[layered_heatmap] loading {model_type} model + final_norm + lm_head…")
+    model, final_norm, lm_head = _load_model_components(model_type, fast_dllm_path)
+    device = next(model.parameters()).device
+    dtype_proj = next(model.parameters()).dtype
+
+    n_collected = 0
+    with torch.no_grad():
+        for path in _iter_sample_paths(probes_root, model_type):
+            if n_collected >= n_samples:
+                break
+            per_block = _load_intra_block(path)
+            if not per_block:
+                continue
+            n_collected += 1
+
+            for block_idx in blocks_to_use:
+                if block_idx not in per_block:
+                    continue
+                data = per_block[block_idx]
+                h_pp = data["h_per_pass"]
+                ts = data["token_state_per_pass"]
+                P = h_pp.shape[0]
+                if P < 2:
+                    continue
+
+                # Project last-layer h through final_norm + lm_head + softmax for shared mass.
+                h_last = torch.from_numpy(
+                    h_pp[:, -1, :, :].astype(np.float32),
+                ).to(device=device, dtype=dtype_proj)            # [P, M, D]
+                logits = lm_head(final_norm(h_last)).float()      # [P, M, V]
+                p_all = F.softmax(logits, dim=-1)
+
+                payload = _layered_heatmap_payload(h_pp, ts, layers_to_plot, p_all)
+                yield path.stem, block_idx, payload
+
+                del h_last, logits, p_all
+                if device.type == "cuda":
+                    torch.cuda.empty_cache()
+
+
+def _plot_layered_heatmap(
+    payload: dict, sample_id: str, block_idx: int, model_name: str,
+    out_path: Path, layers_to_plot: list[int],
+) -> None:
+    import matplotlib.pyplot as plt
+
+    panels: list[tuple[str, np.ndarray | None, str]] = []
+    for layer in layers_to_plot[:5]:
+        cell = payload["layer_diffs"].get(layer)
+        title = f"layer {layer}: cos(h_i, h_0)"
+        panels.append((title, cell, "Cosine similarity"))
+    panels.append((
+        "shared mass: Σ min(p_i, p_0)",
+        payload["shared_mass"],
+        "Shared mass (LM-head distribution overlap)",
+    ))
+
+    revealed = payload["revealed_so_far"]
+    n_iter = revealed.shape[0]
+    M = revealed.shape[1]
+    iters = np.arange(1, n_iter + 1)
+
+    fig, axes = plt.subplots(3, 2, figsize=(11, 10), squeeze=False)
+    cmap = "viridis_r"   # high similarity = dark, low similarity = light
+
+    for idx, (title, cell, cbar_label) in enumerate(panels):
+        ax = axes[idx // 2][idx % 2]
+        if cell is None:
+            ax.text(0.5, 0.5, "no data\n(layer index out of range)",
+                    ha="center", va="center", transform=ax.transAxes)
+            ax.set_visible(False)
+            continue
+        im = ax.imshow(cell, aspect="auto", origin="lower",
+                       interpolation="nearest", cmap=cmap,
+                       vmin=0.0, vmax=1.0,
+                       extent=[-0.5, M - 0.5, 0.5, n_iter + 0.5])
+        ys, xs = np.where(revealed)
+        if len(ys):
+            ax.scatter(xs, ys + 1, marker="x", s=14, c="white", linewidths=0.7)
+        ax.set_title(title, fontsize=11)
+        ax.set_xlabel("position in block")
+        ax.set_ylabel("iteration i (vs pass 0)")
+        ax.set_yticks(iters)
+        fig.colorbar(im, ax=ax, label=cbar_label)
+
+    fig.suptitle(
+        f"{model_name} {sample_id} block {block_idx} — drift / overlap vs pass 0\n"
+        f"(× = position revealed at some pass ≤ i; n_passes={payload['n_passes']})"
+    )
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=130, bbox_inches="tight")
+    plt.close(fig)
+    print(f"saved {out_path}")
+
+
 # --- CLI ---------------------------------------------------------------------
 
 def main() -> None:
@@ -650,7 +804,7 @@ def main() -> None:
     p.add_argument("--probes_root", type=Path, default=Path("probes_out"))
     p.add_argument("--variant",
                    choices=["drift_grouped", "diff_heatmap", "drift_vs_pass0",
-                            "prediction_overlap", "all"],
+                            "prediction_overlap", "layered_heatmap", "all"],
                    default="all")
     p.add_argument("--metric", choices=("l2", "l2_normalized", "cosine_sim", "all"),
                    default="all", help="Drift metric. 'all' produces one plot per metric.")
@@ -670,8 +824,15 @@ def main() -> None:
                         "'pass0' = compare every pass-i to pass-0 (T3 talk_rps reuse story). "
                         "'prev' = consecutive pairs (i-1 → i, speculative cascade story).")
     p.add_argument("--fast_dllm_path", type=str, default=None,
-                   help="Path to Fast-dLLM v1 (only used by prediction_overlap, which loads "
-                        "the model). Defaults to env FAST_DLLM_V1_PATH or ./external/Fast-dLLM/v1.")
+                   help="Path to Fast-dLLM v1 (used by prediction_overlap and layered_heatmap, "
+                        "which load the model). Defaults to env FAST_DLLM_V1_PATH or "
+                        "./external/Fast-dLLM/v1.")
+    p.add_argument("--layered_heatmap_layers", type=str, default="1,8,16,24,32",
+                   help="Comma-separated layer indices to plot in the layered_heatmap variant. "
+                        "First 5 are used for panels 1-5; panel 6 is always shared_mass. "
+                        "Default '1,8,16,24,32' (LLaDA-32 quantiles); for Dream try '1,7,14,21,28'.")
+    p.add_argument("--layered_heatmap_n_samples", type=int, default=5,
+                   help="Number of samples to plot for the layered_heatmap variant. Default 5.")
     args = p.parse_args()
 
     out_dir = args.probes_root / args.model / "plots"
@@ -682,10 +843,12 @@ def main() -> None:
     do_grouped = args.variant in ("drift_grouped", "all")
     do_heatmap = args.variant in ("diff_heatmap", "all")
     do_vs_pass0 = args.variant in ("drift_vs_pass0", "all")
-    # `prediction_overlap` is heavy (loads the model), so only run when the
-    # user explicitly asks for it — *not* included in --variant all.
+    # `prediction_overlap` and `layered_heatmap` load the model; only run
+    # when explicitly asked — not included in --variant all.
     do_prediction_overlap = args.variant == "prediction_overlap"
+    do_layered_heatmap = args.variant == "layered_heatmap"
     blocks_to_use = [int(x) for x in args.vs_pass0_blocks.split(",") if x.strip()]
+    layered_layers = [int(x) for x in args.layered_heatmap_layers.split(",") if x.strip()]
 
     if do_prediction_overlap:
         # prediction_overlap is metric-agnostic (the metric is fixed:
@@ -706,6 +869,26 @@ def main() -> None:
                 f"_n{stats['n_samples']}_ref{args.prediction_overlap_reference}.png"
             )
             _plot_prediction_overlap(stats, out, args.model)
+        return
+
+    if do_layered_heatmap:
+        # Iterates per (sample, block); writes one figure per pair.
+        produced = 0
+        for sample_id, block_idx, payload in _accumulate_layered_heatmaps(
+            args.probes_root, args.model, args.fast_dllm_path,
+            blocks_to_use=blocks_to_use,
+            n_samples=args.layered_heatmap_n_samples,
+            layers_to_plot=layered_layers,
+        ):
+            out = out_dir / (
+                f"intra_block_layered_heatmap_{sample_id}_block{block_idx}.png"
+            )
+            _plot_layered_heatmap(
+                payload, sample_id, block_idx, args.model, out, layered_layers,
+            )
+            produced += 1
+        if produced == 0:
+            print("WARN: no intra_block samples found for layered_heatmap.")
         return
 
     for metric in metrics:
