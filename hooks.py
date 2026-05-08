@@ -456,8 +456,12 @@ class ProbeHooks:
                 k_full = k
                 v_full = v
 
+            # Dream's runner passes attention_mask="full" (literal string) for
+            # prompts without padding; the upstream Dream attention path keys
+            # off `isinstance(attention_mask, torch.Tensor)` to decide whether
+            # to use it. Mirror that — non-tensor → no mask (full attention).
             attn_mask = None
-            if attention_mask is not None:
+            if isinstance(attention_mask, torch.Tensor):
                 attn_mask = attention_mask[:, :, :, : k_full.shape[-2]]
 
             out, attn_weights = _manual_attention(q, k_full, v_full, attn_mask=attn_mask)
