@@ -412,8 +412,12 @@ class ProbeHooks:
 
         hooks_self = self
 
-        def patched_forward(hidden_states, attention_mask=None, position_ids=None,
-                            past_key_value=None, output_attentions=False, use_cache=False, **kwargs):
+        def patched_forward(
+            hidden_states, attention_mask=None, position_ids=None,
+            past_key_value=None, output_attentions=False, use_cache=False,
+            cache_position=None, position_embeddings=None,
+            dual_cache=False, replace_position=None, **kwargs,
+        ):
             # Skip manual-softmax capture on intra-block passes ≥ 1 for the
             # same reason as the LLaDA path (avoid 2× inference cost).
             capture_attn = (
@@ -429,42 +433,80 @@ class ProbeHooks:
                     past_key_value=past_key_value,
                     output_attentions=output_attentions,
                     use_cache=use_cache,
+                    cache_position=cache_position,
+                    position_embeddings=position_embeddings,
+                    dual_cache=dual_cache,
+                    replace_position=replace_position,
                     **kwargs,
                 )
 
-            # Manual path mirrors DreamSdpaAttention.forward but uses _manual_attention.
+            # Manual path mirrors DreamSdpaAttention.forward exactly.
+            # Crucially: Dream's cache is List[Tuple[K, V]] with PRE-RoPE
+            # K/V; cache update happens BEFORE the reshape + RoPE; and
+            # `dual_cache=True` does in-place replacement at
+            # `replace_position` indices instead of concatenating.
             bsz, q_len, _ = hidden_states.size()
-            q = attn_module.q_proj(hidden_states).view(bsz, q_len, n_heads, d_head).transpose(1, 2)
-            k = attn_module.k_proj(hidden_states).view(bsz, q_len, n_kv_heads, d_head).transpose(1, 2)
-            v = attn_module.v_proj(hidden_states).view(bsz, q_len, n_kv_heads, d_head).transpose(1, 2)
+            query_states = attn_module.q_proj(hidden_states)
+            key_states   = attn_module.k_proj(hidden_states)
+            value_states = attn_module.v_proj(hidden_states)
 
-            # Apply RoPE if the module has it
-            cos, sin = attn_module.rotary_emb(v, position_ids) if hasattr(attn_module, "rotary_emb") else (None, None)
+            # ---- Dream cache update (pre-RoPE, [B, T, hidden] shape) ----
+            if past_key_value is not None:
+                if dual_cache:
+                    past_key, past_value = past_key_value
+                    replace_idx = replace_position.nonzero(as_tuple=True)[1]
+                    past_key[:, replace_idx] = key_states
+                    key_states = past_key
+                    past_value[:, replace_idx] = value_states
+                    value_states = past_value
+                else:
+                    past_key, past_value = past_key_value
+                    key_states   = torch.cat([past_key,   key_states],   dim=-2)
+                    value_states = torch.cat([past_value, value_states], dim=-2)
+
+            new_past_key_value = (key_states, value_states) if use_cache else None
+
+            # ---- Reshape for attention ----
+            query_states = query_states.view(bsz, q_len, n_heads, d_head).transpose(1, 2)
+            key_states   = key_states.view(  bsz, -1,  n_kv_heads, d_head).transpose(1, 2)
+            value_states = value_states.view(bsz, -1,  n_kv_heads, d_head).transpose(1, 2)
+
+            # ---- RoPE (apply to full key sequence, including cached) ----
+            if position_embeddings is None and hasattr(attn_module, "rotary_emb"):
+                cos, sin = attn_module.rotary_emb(value_states, position_ids)
+            elif position_embeddings is not None:
+                cos, sin = position_embeddings
+            else:
+                cos, sin = None, None
             if cos is not None:
                 from transformers.models.llama.modeling_llama import apply_rotary_pos_emb
-                q, k = apply_rotary_pos_emb(q, k, cos, sin)
+                query_states, key_states = apply_rotary_pos_emb(
+                    query_states, key_states, cos, sin,
+                )
 
-            if past_key_value is not None:
-                cache_kwargs = {"sin": sin, "cos": cos, "cache_position": kwargs.get("cache_position")}
-                k, v = past_key_value.update(k, v, layer_idx, cache_kwargs)
-
-            # GQA broadcast
+            # ---- GQA broadcast for the attention math + capture ----
             if n_heads != n_kv_heads:
-                k_full = k.repeat_interleave(n_heads // n_kv_heads, dim=1, output_size=n_heads)
-                v_full = v.repeat_interleave(n_heads // n_kv_heads, dim=1, output_size=n_heads)
+                k_full = key_states.repeat_interleave(
+                    n_heads // n_kv_heads, dim=1, output_size=n_heads,
+                )
+                v_full = value_states.repeat_interleave(
+                    n_heads // n_kv_heads, dim=1, output_size=n_heads,
+                )
             else:
-                k_full = k
-                v_full = v
+                k_full = key_states
+                v_full = value_states
 
-            # Dream's runner passes attention_mask="full" (literal string) for
-            # prompts without padding; the upstream Dream attention path keys
-            # off `isinstance(attention_mask, torch.Tensor)` to decide whether
-            # to use it. Mirror that — non-tensor → no mask (full attention).
+            # Dream's runner passes attention_mask="full" (literal string)
+            # for prompts without padding; upstream Dream attention keys off
+            # `isinstance(attention_mask, torch.Tensor)`. Mirror that —
+            # non-tensor → no mask (full attention).
             attn_mask = None
             if isinstance(attention_mask, torch.Tensor):
                 attn_mask = attention_mask[:, :, :, : k_full.shape[-2]]
 
-            out, attn_weights = _manual_attention(q, k_full, v_full, attn_mask=attn_mask)
+            out, attn_weights = _manual_attention(
+                query_states, k_full, v_full, attn_mask=attn_mask,
+            )
 
             # Stash for the probe
             B, H, T_q, T_k = attn_weights.shape
@@ -486,8 +528,7 @@ class ProbeHooks:
             attn_output = out.transpose(1, 2).contiguous().view(bsz, q_len, n_heads * d_head)
             attn_output = attn_module.o_proj(attn_output)
 
-            present_kv = past_key_value if use_cache else None
-            return attn_output, None, present_kv
+            return attn_output, None, new_past_key_value
 
         attn_module.forward = patched_forward
         self._patched_objs.append((attn_module, "forward", original_forward))
