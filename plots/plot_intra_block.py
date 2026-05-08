@@ -77,7 +77,7 @@ METRICS = ("l2", "l2_normalized", "cosine_sim")
 
 
 def _compute_diffs(h_per_pass: np.ndarray, metric: str) -> np.ndarray:
-    """Per (pass-pair, layer, position) drift / similarity.
+    """Per (pass-pair, layer, position) drift / similarity, consecutive pairs.
 
     Args:
         h_per_pass: [n_passes, L+1, num_masked, d_model] (fp16 ok, cast inside).
@@ -88,6 +88,27 @@ def _compute_diffs(h_per_pass: np.ndarray, metric: str) -> np.ndarray:
     h = h_per_pass.astype(np.float32, copy=False)
     a = h[:-1]                                # [P-1, L+1, M, D]
     b = h[1:]
+    return _pairwise_metric(a, b, metric)
+
+
+def _compute_diffs_vs_first(h_per_pass: np.ndarray, metric: str) -> np.ndarray:
+    """Per (i ≥ 1, layer, position) drift / similarity, each pass vs pass 0.
+
+    Args:
+        h_per_pass: [n_passes, L+1, num_masked, d_model].
+        metric: one of METRICS.
+    Returns:
+        [n_passes-1, L+1, num_masked] float32 — index 0 corresponds to
+        pass 1 vs pass 0, index 1 to pass 2 vs pass 0, etc.
+    """
+    h = h_per_pass.astype(np.float32, copy=False)
+    a = h[0:1]                                # [1, L+1, M, D]
+    b = h[1:]                                  # [P-1, L+1, M, D]
+    return _pairwise_metric(a, b, metric)
+
+
+def _pairwise_metric(a: np.ndarray, b: np.ndarray, metric: str) -> np.ndarray:
+    """Apply `metric` to two same-shape (broadcastable) arrays along the last axis."""
     if metric == "l2":
         return np.linalg.norm(a - b, axis=-1)
     if metric == "l2_normalized":
@@ -311,18 +332,161 @@ def _plot_diff_heatmap_one(sample_data: dict, out_path: Path,
     print(f"saved {out_path}")
 
 
+# --- Analysis C: drift vs pass 0 (each iteration compared to first pass) -----
+
+def _accumulate_vs_pass0(probes_root: Path, model: str, metric: str,
+                         blocks_to_use: list[int], n_samples: int,
+                         max_iter: int) -> dict:
+    """For each (iter i, layer), accumulate per-position metric values into
+    sum / sum-of-squares / count, separately for MM and MC groups, where:
+
+    - MM = position still has mask as input at pass i (state[i, p] == 0)
+    - MC = position revealed by some earlier pass (state[i, p] == 1)
+
+    At pass 0 every position is mask, so the (state[0, p], state[i, p])
+    pair reduces to a single state[i, p] classification — that's why this
+    variant has only two groups instead of three.
+
+    The per-iter mean is computed over all (sample, block, position)
+    entries belonging to that group. Variance / SEM follow from the
+    sum-of-squares track. Blocks outside `blocks_to_use` are skipped
+    (default 0, 1 — late blocks have higher EOS-token noise).
+    """
+    n_layers_p1 = None
+    sum_mm = sum_sq_mm = count_mm = None
+    sum_mc = sum_sq_mc = count_mc = None
+    n_collected = 0
+
+    for path in _iter_sample_paths(probes_root, model):
+        if n_collected >= n_samples:
+            break
+        per_block = _load_intra_block(path)
+        if not per_block:
+            continue
+        n_collected += 1
+        for block_idx in blocks_to_use:
+            if block_idx not in per_block:
+                continue
+            data = per_block[block_idx]
+            h = data["h_per_pass"]
+            ts = data["token_state_per_pass"].astype(np.int8)
+            P, Lp1, M, _ = h.shape
+            if P < 2:
+                continue
+
+            if n_layers_p1 is None:
+                n_layers_p1 = Lp1
+                shape = (max_iter, Lp1)
+                sum_mm = np.zeros(shape, dtype=np.float64)
+                sum_sq_mm = np.zeros(shape, dtype=np.float64)
+                count_mm = np.zeros(shape, dtype=np.int64)
+                sum_mc = np.zeros(shape, dtype=np.float64)
+                sum_sq_mc = np.zeros(shape, dtype=np.float64)
+                count_mc = np.zeros(shape, dtype=np.int64)
+
+            n_iter = min(P - 1, max_iter)
+            diffs = _compute_diffs_vs_first(h, metric)[:n_iter]   # [n_iter, L+1, M]
+
+            state_after = ts[1:1 + n_iter]                         # [n_iter, M]
+            mm_pos = (state_after == 0)                             # [n_iter, M]
+            mc_pos = (state_after == 1)                             # [n_iter, M]
+            mm_mask = mm_pos[:, None, :]                            # [n_iter, 1, M]
+            mc_mask = mc_pos[:, None, :]
+
+            d_mm = np.where(mm_mask, diffs, 0.0)
+            d_mc = np.where(mc_mask, diffs, 0.0)
+            n_per_i_mm = mm_pos.sum(axis=1)                         # [n_iter]
+            n_per_i_mc = mc_pos.sum(axis=1)
+
+            sum_mm[:n_iter]    += d_mm.sum(axis=2)
+            sum_sq_mm[:n_iter] += (d_mm ** 2).sum(axis=2)
+            count_mm[:n_iter]  += n_per_i_mm[:, None]               # broadcasts to [n_iter, Lp1]
+            sum_mc[:n_iter]    += d_mc.sum(axis=2)
+            sum_sq_mc[:n_iter] += (d_mc ** 2).sum(axis=2)
+            count_mc[:n_iter]  += n_per_i_mc[:, None]
+
+    return {
+        "sum_mm": sum_mm, "sum_sq_mm": sum_sq_mm, "count_mm": count_mm,
+        "sum_mc": sum_mc, "sum_sq_mc": sum_sq_mc, "count_mc": count_mc,
+        "n_layers_p1": n_layers_p1,
+        "n_samples": n_collected,
+        "blocks": list(blocks_to_use),
+        "max_iter": max_iter,
+    }
+
+
+def _plot_drift_vs_pass0(stats: dict, out_path: Path, model: str, metric: str) -> None:
+    import matplotlib.pyplot as plt
+    sum_mm, sum_sq_mm, count_mm = stats["sum_mm"], stats["sum_sq_mm"], stats["count_mm"]
+    sum_mc, sum_sq_mc, count_mc = stats["sum_mc"], stats["sum_sq_mc"], stats["count_mc"]
+    n_layers_p1 = stats["n_layers_p1"]
+    if n_layers_p1 is None:
+        raise RuntimeError("No intra-block data found. Did you run with --intra_block?")
+    plot_layers = np.arange(1, n_layers_p1)                         # skip layer 0 (embed)
+    max_iter = sum_mm.shape[0]
+
+    fig, (ax_mm, ax_mc) = plt.subplots(1, 2, figsize=(12, 4.2),
+                                       sharey=(metric == "cosine_sim"))
+    cmap = plt.get_cmap("viridis")
+
+    for ax, sum_arr, sumsq_arr, count_arr, group_label in [
+        (ax_mm, sum_mm, sum_sq_mm, count_mm, "MM (still mask at input of pass i)"),
+        (ax_mc, sum_mc, sum_sq_mc, count_mc, "MC (revealed at some earlier pass)"),
+    ]:
+        for i_idx in range(max_iter):
+            n = count_arr[i_idx, 1:].astype(np.float64)              # skip embed
+            if n.sum() == 0:
+                continue
+            mean = sum_arr[i_idx, 1:] / np.maximum(n, 1)
+            var = sumsq_arr[i_idx, 1:] / np.maximum(n, 1) - mean ** 2
+            var = np.clip(var, 0.0, None)                            # FP safety
+            sem = np.sqrt(var / np.maximum(n, 1))
+            color = cmap((i_idx + 0.5) / max_iter)
+            ax.plot(plot_layers, mean, color=color,
+                    label=f"iter {i_idx + 1}", lw=1.4)
+            ax.fill_between(plot_layers, mean - 1.96 * sem, mean + 1.96 * sem,
+                            color=color, alpha=0.18, linewidth=0)
+        ax.set_title(group_label)
+        ax.set_xlabel("Layer k")
+        ax.grid(alpha=0.3)
+        if metric == "cosine_sim":
+            ax.axhline(0.95, ls="--", color="black", alpha=0.45, lw=1.0,
+                       label="0.95 (≈equivalent)")
+        ax.legend(fontsize=8, loc="best")
+
+    ax_mm.set_ylabel(_y_label(metric))
+    fig.suptitle(
+        f"{model}: hidden-state {_metric_word(metric)} between pass 0 and pass i  "
+        f"(95% CI shaded)  [blocks={stats['blocks']}, n_samples={stats['n_samples']}, "
+        f"layers 1+]"
+    )
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=130, bbox_inches="tight")
+    plt.close(fig)
+    print(f"saved {out_path}")
+
+
 # --- CLI ---------------------------------------------------------------------
 
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     p.add_argument("--model", choices=["llada", "dream"], required=True)
     p.add_argument("--probes_root", type=Path, default=Path("probes_out"))
-    p.add_argument("--variant", choices=["drift_grouped", "diff_heatmap", "all"],
+    p.add_argument("--variant",
+                   choices=["drift_grouped", "diff_heatmap", "drift_vs_pass0", "all"],
                    default="all")
     p.add_argument("--metric", choices=("l2", "l2_normalized", "cosine_sim", "all"),
                    default="all", help="Drift metric. 'all' produces one plot per metric.")
     p.add_argument("--n_samples_heatmap", type=int, default=5,
                    help="Number of samples to plot per metric for the diff_heatmap variant.")
+    p.add_argument("--vs_pass0_blocks", type=str, default="0,1",
+                   help="Comma-separated block indices to aggregate for the drift_vs_pass0 "
+                        "variant. Default '0,1' — late blocks have higher EOS-token noise.")
+    p.add_argument("--vs_pass0_n_samples", type=int, default=5,
+                   help="Sample count for drift_vs_pass0 (5 for fast iteration; bump to 100 "
+                        "for paper-quality bands).")
+    p.add_argument("--vs_pass0_max_iter", type=int, default=6,
+                   help="Number of denoise iterations to plot in drift_vs_pass0. Default 6.")
     args = p.parse_args()
 
     out_dir = args.probes_root / args.model / "plots"
@@ -332,6 +496,8 @@ def main() -> None:
 
     do_grouped = args.variant in ("drift_grouped", "all")
     do_heatmap = args.variant in ("diff_heatmap", "all")
+    do_vs_pass0 = args.variant in ("drift_vs_pass0", "all")
+    blocks_to_use = [int(x) for x in args.vs_pass0_blocks.split(",") if x.strip()]
 
     for metric in metrics:
         if do_grouped:
@@ -354,6 +520,23 @@ def main() -> None:
                 out = out_dir / f"intra_block_diff_heatmap_{metric}_{sample_id}.png"
                 _plot_diff_heatmap_one(per_block, out, args.model, metric,
                                        sample_id, vmin, vmax)
+
+        if do_vs_pass0:
+            stats = _accumulate_vs_pass0(
+                args.probes_root, args.model, metric,
+                blocks_to_use=blocks_to_use,
+                n_samples=args.vs_pass0_n_samples,
+                max_iter=args.vs_pass0_max_iter,
+            )
+            if stats["n_layers_p1"] is None:
+                print(f"WARN: no intra_block samples found for drift_vs_pass0/{metric}.")
+            else:
+                blocks_tag = "-".join(str(b) for b in blocks_to_use)
+                out = out_dir / (
+                    f"intra_block_drift_vs_pass0_{metric}"
+                    f"_blocks{blocks_tag}_n{stats['n_samples']}.png"
+                )
+                _plot_drift_vs_pass0(stats, out, args.model, metric)
 
 
 if __name__ == "__main__":
