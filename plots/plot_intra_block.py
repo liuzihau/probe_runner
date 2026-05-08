@@ -466,6 +466,182 @@ def _plot_drift_vs_pass0(stats: dict, out_path: Path, model: str, metric: str) -
     print(f"saved {out_path}")
 
 
+# --- Analysis D: prediction-distribution overlap (speculative-style) ---------
+#
+# For each (sample, block, pass i), project the LAST-LAYER hidden state at
+# pass i and at the reference pass (pass 0 by default, or i-1) through the
+# model's final norm + LM head + softmax, then compute
+#
+#     shared_mass(p, q) = Σ_x min(p(x), q(x))   ∈ [0, 1]
+#
+# This is the closed-form expected acceptance rate from speculative decoding
+# (Leviathan et al. 2023, Chen et al. 2023): if pass-0 (or the previous pass)
+# were used as a draft for pass-i as the target, what fraction of mass is
+# shared between the two distributions? It's also `1 - 0.5·||p − q||₁` (TV
+# overlap). Plotted as iteration → shared_mass with 95% CI shading, MM and
+# MC side-by-side.
+#
+# Costs: requires loading the model (final_norm + lm_head). Reuses
+# `plot_logit_lens._load_model_components` to avoid duplication.
+
+def _accumulate_prediction_overlap(
+    probes_root: Path,
+    model_type: str,
+    fast_dllm_path: str | None,
+    *,
+    blocks_to_use: list[int],
+    n_samples: int,
+    max_iter: int,
+    reference: str,            # "pass0" or "prev"
+) -> dict:
+    import torch
+    import torch.nn.functional as F
+    from probe_runner.plots.plot_logit_lens import _load_model_components
+
+    print(f"[prediction_overlap] loading {model_type} model + final_norm + lm_head…")
+    model, final_norm, lm_head = _load_model_components(model_type, fast_dllm_path)
+    device = next(model.parameters()).device
+    dtype_proj = next(model.parameters()).dtype
+
+    sum_mm = sum_sq_mm = count_mm = None
+    sum_mc = sum_sq_mc = count_mc = None
+    n_collected = 0
+
+    with torch.no_grad():
+        for path in _iter_sample_paths(probes_root, model_type):
+            if n_collected >= n_samples:
+                break
+            per_block = _load_intra_block(path)
+            if not per_block:
+                continue
+            n_collected += 1
+
+            for block_idx in blocks_to_use:
+                if block_idx not in per_block:
+                    continue
+                data = per_block[block_idx]
+                h_pp = data["h_per_pass"]                       # [P, L+1, M, D]
+                ts = data["token_state_per_pass"].astype(np.int8)  # [P, M]
+                P, Lp1, M, D = h_pp.shape
+                if P < 2:
+                    continue
+
+                if sum_mm is None:
+                    shape = (max_iter,)
+                    sum_mm = np.zeros(shape, dtype=np.float64)
+                    sum_sq_mm = np.zeros(shape, dtype=np.float64)
+                    count_mm = np.zeros(shape, dtype=np.int64)
+                    sum_mc = np.zeros(shape, dtype=np.float64)
+                    sum_sq_mc = np.zeros(shape, dtype=np.float64)
+                    count_mc = np.zeros(shape, dtype=np.int64)
+
+                n_iter = min(P - 1, max_iter)
+
+                # Project last-layer hidden states across all passes we need
+                # in one shot (saves redundant ln_f / lm_head invocations).
+                h_last = torch.from_numpy(
+                    h_pp[: n_iter + 1, -1, :, :].astype(np.float32)
+                ).to(device=device, dtype=dtype_proj)              # [n_iter+1, M, D]
+                logits = lm_head(final_norm(h_last)).float()        # [n_iter+1, M, V]
+                p_all = F.softmax(logits, dim=-1)                    # [n_iter+1, M, V]
+
+                for i_idx in range(n_iter):
+                    pass_i = i_idx + 1
+                    ref_idx = 0 if reference == "pass0" else i_idx
+                    p_target = p_all[pass_i]                         # [M, V]
+                    p_draft = p_all[ref_idx]                         # [M, V]
+                    shared = torch.minimum(p_target, p_draft).sum(dim=-1)  # [M]
+                    shared_np = shared.cpu().numpy()
+
+                    state_at_i = ts[pass_i]                          # [M]
+                    mm = (state_at_i == 0)
+                    mc = (state_at_i == 1)
+
+                    if mm.any():
+                        sm = shared_np[mm]
+                        sum_mm[i_idx] += sm.sum()
+                        sum_sq_mm[i_idx] += (sm ** 2).sum()
+                        count_mm[i_idx] += int(mm.sum())
+                    if mc.any():
+                        sm = shared_np[mc]
+                        sum_mc[i_idx] += sm.sum()
+                        sum_sq_mc[i_idx] += (sm ** 2).sum()
+                        count_mc[i_idx] += int(mc.sum())
+
+                del h_last, logits, p_all
+                if device.type == "cuda":
+                    torch.cuda.empty_cache()
+
+            if n_collected % 5 == 0 or n_collected == n_samples:
+                print(f"[prediction_overlap] processed {n_collected}/{n_samples}")
+
+    return {
+        "sum_mm": sum_mm, "sum_sq_mm": sum_sq_mm, "count_mm": count_mm,
+        "sum_mc": sum_mc, "sum_sq_mc": sum_sq_mc, "count_mc": count_mc,
+        "n_samples": n_collected,
+        "blocks": list(blocks_to_use),
+        "max_iter": max_iter,
+        "reference": reference,
+    }
+
+
+def _plot_prediction_overlap(stats: dict, out_path: Path, model_name: str) -> None:
+    import matplotlib.pyplot as plt
+    sum_mm = stats["sum_mm"]; sum_sq_mm = stats["sum_sq_mm"]; count_mm = stats["count_mm"]
+    sum_mc = stats["sum_mc"]; sum_sq_mc = stats["sum_sq_mc"]; count_mc = stats["count_mc"]
+    if sum_mm is None:
+        raise RuntimeError("No intra-block data found. Did you run with --intra_block?")
+
+    max_iter = sum_mm.shape[0]
+    iters = np.arange(1, max_iter + 1)
+    ref_label = "pass 0" if stats["reference"] == "pass0" else "previous pass (i−1)"
+
+    fig, (ax_mm, ax_mc) = plt.subplots(1, 2, figsize=(11, 4), sharey=True)
+
+    for ax, sum_arr, sumsq_arr, count_arr, group_label, color in [
+        (ax_mm, sum_mm, sum_sq_mm, count_mm,
+         "MM (still mask at input of pass i)", "tab:gray"),
+        (ax_mc, sum_mc, sum_sq_mc, count_mc,
+         "MC (revealed at some pass < i)", "tab:red"),
+    ]:
+        n = count_arr.astype(np.float64)
+        valid = n > 0
+        if not valid.any():
+            ax.text(0.5, 0.5, "no data", ha="center", va="center", transform=ax.transAxes)
+        else:
+            mean = np.where(valid, sum_arr / np.maximum(n, 1), np.nan)
+            var = np.where(valid, sumsq_arr / np.maximum(n, 1) - mean ** 2, 0.0)
+            var = np.clip(var, 0.0, None)
+            sem = np.where(valid, np.sqrt(var / np.maximum(n, 1)), 0.0)
+            ax.plot(iters, mean, "-o", color=color, lw=1.6, markersize=5)
+            ax.fill_between(iters, mean - 1.96 * sem, mean + 1.96 * sem,
+                            color=color, alpha=0.18, linewidth=0)
+            # Sample-count annotations help spot iterations with thin support.
+            for i, c, m in zip(iters, count_arr, mean):
+                if not np.isnan(m):
+                    ax.annotate(f"n={int(c)}", (i, m),
+                                textcoords="offset points", xytext=(0, 8),
+                                ha="center", fontsize=7, color="gray")
+        ax.axhline(0.95, ls="--", color="black", alpha=0.45, lw=1.0,
+                   label="0.95 (≈identical predictions)")
+        ax.set_title(group_label)
+        ax.set_xlabel("Iteration i")
+        ax.set_xticks(iters)
+        ax.set_ylim(0.0, 1.05)
+        ax.grid(alpha=0.3)
+        ax.legend(fontsize=8, loc="lower left")
+
+    ax_mm.set_ylabel(r"Shared mass  $\sum_x \min(p_i(x), q(x))$")
+    fig.suptitle(
+        f"{model_name}: prediction-distribution overlap (target=pass i, draft={ref_label})\n"
+        f"[blocks={stats['blocks']}, n_samples={stats['n_samples']}, 95% CI shaded]"
+    )
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=130, bbox_inches="tight")
+    plt.close(fig)
+    print(f"saved {out_path}")
+
+
 # --- CLI ---------------------------------------------------------------------
 
 def main() -> None:
@@ -473,7 +649,8 @@ def main() -> None:
     p.add_argument("--model", choices=["llada", "dream"], required=True)
     p.add_argument("--probes_root", type=Path, default=Path("probes_out"))
     p.add_argument("--variant",
-                   choices=["drift_grouped", "diff_heatmap", "drift_vs_pass0", "all"],
+                   choices=["drift_grouped", "diff_heatmap", "drift_vs_pass0",
+                            "prediction_overlap", "all"],
                    default="all")
     p.add_argument("--metric", choices=("l2", "l2_normalized", "cosine_sim", "all"),
                    default="all", help="Drift metric. 'all' produces one plot per metric.")
@@ -487,6 +664,14 @@ def main() -> None:
                         "for paper-quality bands).")
     p.add_argument("--vs_pass0_max_iter", type=int, default=6,
                    help="Number of denoise iterations to plot in drift_vs_pass0. Default 6.")
+    p.add_argument("--prediction_overlap_reference", choices=["pass0", "prev"],
+                   default="pass0",
+                   help="Reference distribution for prediction_overlap variant. "
+                        "'pass0' = compare every pass-i to pass-0 (T3 talk_rps reuse story). "
+                        "'prev' = consecutive pairs (i-1 → i, speculative cascade story).")
+    p.add_argument("--fast_dllm_path", type=str, default=None,
+                   help="Path to Fast-dLLM v1 (only used by prediction_overlap, which loads "
+                        "the model). Defaults to env FAST_DLLM_V1_PATH or ./external/Fast-dLLM/v1.")
     args = p.parse_args()
 
     out_dir = args.probes_root / args.model / "plots"
@@ -497,7 +682,31 @@ def main() -> None:
     do_grouped = args.variant in ("drift_grouped", "all")
     do_heatmap = args.variant in ("diff_heatmap", "all")
     do_vs_pass0 = args.variant in ("drift_vs_pass0", "all")
+    # `prediction_overlap` is heavy (loads the model), so only run when the
+    # user explicitly asks for it — *not* included in --variant all.
+    do_prediction_overlap = args.variant == "prediction_overlap"
     blocks_to_use = [int(x) for x in args.vs_pass0_blocks.split(",") if x.strip()]
+
+    if do_prediction_overlap:
+        # prediction_overlap is metric-agnostic (the metric is fixed:
+        # shared_mass on softmax(lm_head(ln_f(h_last)))). Run it once.
+        stats = _accumulate_prediction_overlap(
+            args.probes_root, args.model, args.fast_dllm_path,
+            blocks_to_use=blocks_to_use,
+            n_samples=args.vs_pass0_n_samples,
+            max_iter=args.vs_pass0_max_iter,
+            reference=args.prediction_overlap_reference,
+        )
+        if stats["sum_mm"] is None:
+            print("WARN: no intra_block samples found for prediction_overlap.")
+        else:
+            blocks_tag = "-".join(str(b) for b in blocks_to_use)
+            out = out_dir / (
+                f"intra_block_prediction_overlap_blocks{blocks_tag}"
+                f"_n{stats['n_samples']}_ref{args.prediction_overlap_reference}.png"
+            )
+            _plot_prediction_overlap(stats, out, args.model)
+        return
 
     for metric in metrics:
         if do_grouped:
