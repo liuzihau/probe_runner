@@ -6,7 +6,9 @@ File layout (per sample, see ../T3_pruning_probe_step1to4.md §4.1):
     ├── block_0/
     │   ├── attn        [num_masked, L, H, S_0]   float16
     │   ├── v_norm      [L, H, S_0]               float32   (optional per config)
-    │   └── h_masked    [L+1, num_masked, d_model] float16
+    │   ├── h_masked    [L+1, num_masked, d_model] float16
+    │   ├── k_prompt    [L, n_kv_heads, prompt_len, d_head] float16  (optional, --prompt_kv)
+    │   └── v_prompt    [L, n_kv_heads, prompt_len, d_head] float16  (optional, --prompt_kv)
     ├── block_1/
     │   └── ...
     ├── ...
@@ -75,6 +77,12 @@ def write_h5(
             if tensors.get("v_norm") is not None:
                 grp.create_dataset("v_norm", data=_to_numpy(tensors["v_norm"]), compression="gzip", compression_opts=4)
             grp.create_dataset("h_masked", data=_to_numpy(tensors["h_masked"]), compression="gzip", compression_opts=4)
+            if tensors.get("k_prompt") is not None:
+                grp.create_dataset("k_prompt", data=_to_numpy(tensors["k_prompt"]),
+                                   compression="gzip", compression_opts=4)
+            if tensors.get("v_prompt") is not None:
+                grp.create_dataset("v_prompt", data=_to_numpy(tensors["v_prompt"]),
+                                   compression="gzip", compression_opts=4)
             if intra_block_per_block and block_idx in intra_block_per_block:
                 ib = intra_block_per_block[block_idx]
                 grp.create_dataset("h_per_pass", data=_to_numpy(ib["h_per_pass"]),
@@ -125,7 +133,8 @@ def read_h5(path: str | Path) -> dict[str, Any]:
             if "v_norm" in grp:
                 block_data["v_norm"] = np.asarray(grp["v_norm"])
             block_data["h_masked"] = np.asarray(grp["h_masked"])
-            for name in ("h_per_pass", "token_state_per_pass", "revealed_per_pass", "pass_indices"):
+            for name in ("h_per_pass", "token_state_per_pass", "revealed_per_pass", "pass_indices",
+                         "k_prompt", "v_prompt"):
                 if name in grp:
                     block_data[name] = np.asarray(grp[name])
             out["blocks"][block_idx] = block_data

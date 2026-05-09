@@ -90,6 +90,8 @@ class _BlockBuffer:
     v_norm: list[torch.Tensor] = field(default_factory=list)        # per layer: [H, S]
     h: list[torch.Tensor] = field(default_factory=list)             # per layer: [num_masked, d_model]
                                                                       # h[0] = embedding output, h[1..L] = block outputs
+    k_prompt: list[torch.Tensor] = field(default_factory=list)      # per layer: [n_kv_heads, prompt_len, d_head]
+    v_prompt: list[torch.Tensor] = field(default_factory=list)      # per layer: [n_kv_heads, prompt_len, d_head]
 
 
 @dataclass
@@ -150,6 +152,7 @@ class ProbeHooks:
         d_head: int,
         record_v_norm: bool = True,
         intra_block: bool = False,
+        record_prompt_kv: bool = False,
     ):
         self.model_type = model_type
         self.n_layers = n_layers
@@ -157,6 +160,14 @@ class ProbeHooks:
         self.d_head = d_head
         self.record_v_norm = record_v_norm
         self.intra_block = bool(intra_block)
+        # When True, capture per-block per-layer post-RoPE K/V at prompt
+        # positions during pass 0 of each block — for cross-block prefix
+        # KV-drift analysis (does the cached prompt KV that pass-0 freshly
+        # recomputes stay close from block to block?).
+        self.record_prompt_kv = bool(record_prompt_kv)
+        # Absolute positions to slice K/V at when record_prompt_kv is on.
+        # Set once per sample via set_prompt_indices.
+        self.prompt_indices: list[int] | None = None
 
         self.armed = False
         self.current_block: int | None = None
@@ -185,6 +196,14 @@ class ProbeHooks:
             raise ValueError(f"Unknown model_type: {model_type}")
 
     # ---- public API ----
+
+    def set_prompt_indices(self, prompt_indices: list[int]) -> None:
+        """Set the absolute prompt positions to capture K/V at (pass 0 only).
+
+        Must be called once per sample before the first forward when
+        `record_prompt_kv=True`. The same indices are reused for every block.
+        """
+        self.prompt_indices = list(prompt_indices)
 
     def set_block(self, block_idx: int, masked_positions: list[int]) -> None:
         self.current_block = block_idx
@@ -238,7 +257,9 @@ class ProbeHooks:
         """Stack per-layer lists into [L, ...] tensors per block.
 
         Returns mapping: block_idx → {"attn": [num_masked, L, H, S], "v_norm": [L, H, S] or None,
-                                       "h_masked": [L+1, num_masked, d_model]}
+                                       "h_masked": [L+1, num_masked, d_model],
+                                       "k_prompt": [L, n_kv_heads, prompt_len, d_head] or None,
+                                       "v_prompt": [L, n_kv_heads, prompt_len, d_head] or None}
         """
         out: dict[int, dict[str, torch.Tensor]] = {}
         for block_idx, buf in self._buffers.items():
@@ -246,7 +267,12 @@ class ProbeHooks:
             attn = torch.stack(buf.attn, dim=1) if buf.attn else None  # → [num_masked, L, H, S]
             v_norm = torch.stack(buf.v_norm, dim=0) if buf.v_norm else None  # → [L, H, S]
             h = torch.stack(buf.h, dim=0) if buf.h else None  # → [L+1, num_masked, d_model]
-            out[block_idx] = {"attn": attn, "v_norm": v_norm, "h_masked": h}
+            k_prompt = torch.stack(buf.k_prompt, dim=0) if buf.k_prompt else None  # → [L, n_kv_heads, prompt_len, d_head]
+            v_prompt = torch.stack(buf.v_prompt, dim=0) if buf.v_prompt else None
+            out[block_idx] = {
+                "attn": attn, "v_norm": v_norm, "h_masked": h,
+                "k_prompt": k_prompt, "v_prompt": v_prompt,
+            }
         return out
 
     def collect_intra_block(self) -> dict[int, dict[str, torch.Tensor]]:
@@ -369,6 +395,15 @@ class ProbeHooks:
                 buf.attn.append(attn_at_m)
                 if v_norm is not None:
                     buf.v_norm.append(v_norm)
+                # Capture pre-GQA-broadcast post-RoPE K/V at prompt positions.
+                # k/v shapes here are [B=1, n_kv_heads, T_k, d_head] — what
+                # actually lands in the cache at pass 0 of every block.
+                if hooks_self.record_prompt_kv and hooks_self.prompt_indices is not None:
+                    p_idx = hooks_self.prompt_indices
+                    k_at_prompt = k[0, :, p_idx, :].to(torch.float16).cpu()  # [n_kv_heads, prompt_len, d_head]
+                    v_at_prompt = v[0, :, p_idx, :].to(torch.float16).cpu()
+                    buf.k_prompt.append(k_at_prompt)
+                    buf.v_prompt.append(v_at_prompt)
                 return out
             else:
                 # Disarmed OR intra-block pass ≥ 1: fall back to the
@@ -483,6 +518,18 @@ class ProbeHooks:
                 query_states, key_states = apply_rotary_pos_emb(
                     query_states, key_states, cos, sin,
                 )
+
+            # Capture pre-GQA-broadcast post-RoPE K/V at prompt positions
+            # before broadcasting. key_states / value_states shapes here are
+            # [B=1, n_kv_heads, T_k, d_head]. Pass-0 only (capture_attn gate
+            # above ensures this), so T_k = full sequence length.
+            if hooks_self.record_prompt_kv and hooks_self.prompt_indices is not None:
+                p_idx = hooks_self.prompt_indices
+                k_at_prompt = key_states[0, :, p_idx, :].to(torch.float16).cpu()
+                v_at_prompt = value_states[0, :, p_idx, :].to(torch.float16).cpu()
+                buf_kv = hooks_self._buffers[hooks_self.current_block]
+                buf_kv.k_prompt.append(k_at_prompt)
+                buf_kv.v_prompt.append(v_at_prompt)
 
             # ---- GQA broadcast for the attention math + capture ----
             if n_heads != n_kv_heads:

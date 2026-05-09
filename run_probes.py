@@ -94,7 +94,8 @@ def run_for_model(model_type: str, *, n_samples: int = 100, output_root: Path | 
                   max_prompt_tokens: int = 512, gen_length: int = 256, block_length: int = 32,
                   steps: int = 256, threshold: float = 0.9,
                   fast_dllm_path: str | Path | None = None,
-                  intra_block: bool = False) -> dict:
+                  intra_block: bool = False,
+                  prompt_kv: bool = False) -> dict:
     output_root = output_root or Path(configs.PROBE_CONFIG["output"]["root"])
     out_dir = output_root / model_type
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -175,7 +176,12 @@ def run_for_model(model_type: str, *, n_samples: int = 100, output_root: Path | 
             d_head=dims["d_head"],
             record_v_norm=True,  # we toggle per-block via a wrapper below
             intra_block=intra_block,
+            record_prompt_kv=prompt_kv,
         )
+        if prompt_kv:
+            # Same prompt indices reused across all 8 blocks; pass-0-only
+            # capture handled inside the hooks.
+            hooks.set_prompt_indices(list(range(prompt_len)))
 
         def on_block_start(block_idx: int, masked_positions_abs: list[int]):
             if block_idx not in record_blocks_set:
@@ -335,6 +341,17 @@ def main():
              "sample of fp16 h_per_pass; needed for the intra-block drift / "
              "diff-heatmap analyses.",
     )
+    parser.add_argument(
+        "--prompt_kv",
+        action="store_true",
+        help="Record per-block per-layer post-RoPE K/V at prompt positions "
+             "(pass-0 only). Each block's pass-0 forward freshly recomputes "
+             "the prompt-region KV under Fast-dLLM's dual-cache, so this "
+             "captures whether that recomputed prompt KV drifts block-to-block. "
+             "Adds ~256 MB / sample (LLaDA, no GQA, prompt_len=512) or "
+             "~32 MB / sample (Dream, GQA factor 8). Required by "
+             "plots.plot_prompt_kv_drift.",
+    )
     args = parser.parse_args()
 
     # Validate Fast-dLLM is reachable BEFORE we start loading large models.
@@ -353,6 +370,7 @@ def main():
             output_root=output_root,
             fast_dllm_path=args.fast_dllm_path,
             intra_block=args.intra_block,
+            prompt_kv=args.prompt_kv,
         )
 
     write_meta(summaries, output_root)
