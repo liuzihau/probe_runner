@@ -51,23 +51,42 @@ def load_llada2(
     t3dmax_root: str | Path | None = None,
     device: str = "cuda",
 ):
-    """Load LLaDA2MoeModelLM (LLaDA-2.0-mini or DMax-Math-16B — same arch).
+    """Load LLaDA-2.0-mini / DMax-Math-16B (same arch; the weights select which).
 
-    `attn_implementation`: use "eager" to let the probe capture attention
-    weights / v_norm (the info-flow plots); "sdpa" (default) is faster and
-    fine for the hidden-state trajectory metrics, which need no attn weights.
+    Mirrors the proven recipe in T3-DMax's ``probe_collect_t3d.py``:
+    ``AutoModelForCausalLM.from_pretrained`` first (works when the checkpoint
+    bundles its model code), else the **dFactory** ``LLaDA2MoeModelLM`` — the
+    *dInfer* copy of that class imports ``vllm`` and is unusable in a plain
+    PyTorch env, and ``dinfer.model``'s ``__init__`` silently drops the symbol
+    when that import fails. The dFactory copy is pure torch and HF-standard
+    (``from_pretrained``, not the dInfer ``load_weights``).
+
+    `attn_implementation`: "eager" lets the probe capture attn/v_norm; "sdpa"
+    (default) is faster and fine for the hidden-state trajectory metrics.
     """
     configs.add_llada2_to_path(t3dmax_root)
-    from dinfer.model import LLaDA2MoeModelLM  # type: ignore  # noqa: WPS433
-    from transformers import AutoConfig, AutoTokenizer  # noqa: WPS433
+    from transformers import AutoModelForCausalLM, AutoConfig, AutoTokenizer  # noqa: WPS433
 
     model_path = os.path.abspath(str(model_path))
-    cfg = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
-    cfg._attn_implementation = attn_implementation
-    model = LLaDA2MoeModelLM(config=cfg).eval()
-    # Custom sharded-safetensors loader (NOT from_pretrained); see digest §8.
-    model.load_weights(model_path, torch_dtype=dtype, device=device)
-    model.to(device)
+    try:
+        model = AutoModelForCausalLM.from_pretrained(
+            model_path, trust_remote_code=True, torch_dtype=dtype,
+            attn_implementation=attn_implementation)
+    except Exception as exc:  # vllm-bundled code / non-Auto checkpoint format
+        print(f"[llada2] AutoModelForCausalLM failed ({type(exc).__name__}: {exc}); "
+              f"falling back to dFactory LLaDA2MoeModelLM")
+        from models.llada2_moe.modeling_llada2_moe import LLaDA2MoeModelLM  # type: ignore
+        cfg = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+        if not str(getattr(cfg, "model_type", "")).endswith("_veomni"):
+            cfg.model_type = str(cfg.model_type) + "_veomni"
+        if getattr(cfg, "moe_implementation", None) != "fused":
+            cfg.moe_implementation = "fused"
+        model = LLaDA2MoeModelLM.from_pretrained(
+            model_path, config=cfg, torch_dtype=dtype,
+            attn_implementation=attn_implementation)
+    if hasattr(getattr(model, "model", None), "gradient_checkpointing"):
+        model.model.gradient_checkpointing = False
+    model.eval().to(device)
     tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
     return model, tokenizer
 
