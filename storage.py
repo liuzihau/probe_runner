@@ -64,6 +64,8 @@ def write_h5(
     `intra_block_per_block` (optional) maps block_idx → {"h_per_pass":
     [n_passes, L+1, num_masked, d_model], "token_state_per_pass":
     [n_passes, num_masked], "revealed_per_pass": [n_passes, num_masked],
+    "committed_tokens_per_pass": [n_passes, num_masked] (int; mask_id where
+    still masked — enables the CR domain + converged token + rank trajectory),
     "pass_indices": [n_passes]}. When provided, written as additional
     datasets under each block group; n_passes is per-block ragged.
     """
@@ -73,10 +75,14 @@ def write_h5(
     with h5py.File(path, "w") as f:
         for block_idx, tensors in sorted(data_per_block.items()):
             grp = f.create_group(f"block_{block_idx}")
-            grp.create_dataset("attn", data=_to_numpy(tensors["attn"]), compression="gzip", compression_opts=4)
+            # attn / v_norm are absent on hidden-only runs (e.g. llada2 with
+            # attn_implementation='sdpa') — write only when captured.
+            if tensors.get("attn") is not None:
+                grp.create_dataset("attn", data=_to_numpy(tensors["attn"]), compression="gzip", compression_opts=4)
             if tensors.get("v_norm") is not None:
                 grp.create_dataset("v_norm", data=_to_numpy(tensors["v_norm"]), compression="gzip", compression_opts=4)
-            grp.create_dataset("h_masked", data=_to_numpy(tensors["h_masked"]), compression="gzip", compression_opts=4)
+            if tensors.get("h_masked") is not None:
+                grp.create_dataset("h_masked", data=_to_numpy(tensors["h_masked"]), compression="gzip", compression_opts=4)
             if tensors.get("k_prompt") is not None:
                 grp.create_dataset("k_prompt", data=_to_numpy(tensors["k_prompt"]),
                                    compression="gzip", compression_opts=4)
@@ -91,6 +97,14 @@ def write_h5(
                                    compression="gzip", compression_opts=4)
                 grp.create_dataset("revealed_per_pass", data=_to_numpy(ib["revealed_per_pass"]),
                                    compression="gzip", compression_opts=4)
+                if ib.get("committed_tokens_per_pass") is not None:
+                    grp.create_dataset("committed_tokens_per_pass",
+                                       data=_to_numpy(ib["committed_tokens_per_pass"]),
+                                       compression="gzip", compression_opts=4)
+                if ib.get("converged_tokens") is not None:
+                    # [num_masked] final decode (post last commit) — the rank/flip
+                    # reference; from output_ids, not derivable from the per-pass inputs.
+                    grp.create_dataset("converged_tokens", data=_to_numpy(ib["converged_tokens"]))
                 grp.create_dataset("pass_indices", data=_to_numpy(ib["pass_indices"]))
 
         f.attrs["prompt_len"] = int(prompt_len)
@@ -129,11 +143,15 @@ def read_h5(path: str | Path) -> dict[str, Any]:
                 continue
             block_idx = int(grp_name.split("_")[1])
             grp = f[grp_name]
-            block_data = {"attn": np.asarray(grp["attn"])}
+            block_data = {}
+            if "attn" in grp:
+                block_data["attn"] = np.asarray(grp["attn"])
             if "v_norm" in grp:
                 block_data["v_norm"] = np.asarray(grp["v_norm"])
-            block_data["h_masked"] = np.asarray(grp["h_masked"])
-            for name in ("h_per_pass", "token_state_per_pass", "revealed_per_pass", "pass_indices",
+            if "h_masked" in grp:
+                block_data["h_masked"] = np.asarray(grp["h_masked"])
+            for name in ("h_per_pass", "token_state_per_pass", "revealed_per_pass",
+                         "committed_tokens_per_pass", "converged_tokens", "pass_indices",
                          "k_prompt", "v_prompt"):
                 if name in grp:
                     block_data[name] = np.asarray(grp[name])

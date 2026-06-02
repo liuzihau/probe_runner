@@ -8,9 +8,78 @@ generation, and provides a family of plotting scripts that distil those
 captures into the kind of figures used to drive layer-pruning,
 KV-reuse, and feature-staleness decisions for the T3 project.
 
-This repo is **self-contained**. The only external dependency is
-**Fast-dLLM v1**, fetched by `setup.sh`. No assumption is made about
-Think-Then-Talk being checked out anywhere.
+This repo is **self-contained** for the LLaDA-8B / Dream-7B path; its only
+external dependency there is **Fast-dLLM v1**, fetched by `setup.sh`.
+
+> **LLaDA-2.0-mini / DMax-Math-16B (T3-D refresh & repair probe).** A second
+> capture+analysis path targets the LLaDA-2.0-MoE family and the T3-D
+> "Think-Then-Talk" question. It replicates DMax's `decode_uniform` decode and
+> adds four trajectory analyses (rank / domains / repairability / refresh).
+> Design: `T3D_LLADA2_REFRESH_REPAIR_DESIGN.md`. Usage: **§ LLaDA-2.0 / DMax**
+> below. This path imports the model code from a **T3-DMax checkout** (not
+> Fast-dLLM).
+
+---
+
+## LLaDA-2.0 / DMax — refresh & repair probe (T3-D)
+
+Studies the heavy model's per-iteration refinement trajectory to decide whether
+an **anchor-refresh** lever is worth building (see the design doc for the full
+metric set and decision map). Works on **LLaDA-2.0-mini** and its finetune
+**DMax-Math-16B** (same arch; the weight path selects which).
+
+**Prerequisites**
+
+- A **T3-DMax checkout** (provides `LLaDA2MoeModelLM` + the ThinkTalk model).
+  Found via `--t3dmax_root`, env `T3DMAX_ROOT`, or the default relative path
+  `../T3/T3-D/T3-DMax`.
+- **Model weights** (HF dir) for LLaDA-2.0-mini or DMax-Math-16B, via
+  `--model_path` or env `T3DMAX_LLADA2_MODEL` / `T3DMAX_DMAX_MODEL`.
+
+**1. Capture** (`--intra_block` is required — the per-pass trajectory is the
+substrate for every analysis):
+
+```bash
+# DMax-Math-16B, soft decode_uniform (revisable commits → CR domain live):
+python -m probe_runner.run_probes --model llada2 --intra_block \
+    --model_path /path/to/DMax-Math-16B --decode_mode soft
+
+# LLaDA-2.0-mini, threshold decode (hard commit, no CR):
+python -m probe_runner.run_probes --model llada2 --intra_block \
+    --model_path /path/to/LLaDA2.0-mini-moe-merge --decode_mode hard
+```
+
+This writes `probes_out/llada2/sample_*.h5` (with `committed_tokens_per_pass`
+and `converged_tokens`) plus `probes_out/llada2/lm_head.pt` — the final-norm +
+lm_head export so the rank/repair analyses map hidden→logits **without
+reloading the 16B model**. Add `--attn_impl eager` to also capture attn/v_norm.
+
+**2. Analyses** (all write to `probes_out/llada2/plots/`):
+
+```bash
+# A7 — converged-token rank trajectory (the graded premise + oracle ceiling)
+python -m probe_runner.plots.plot_rank_trajectory --model llada2
+
+# A1/A3-A6 — 4-domain (CU/CR/MC/MM) split for an iter-pair, + divergence-onset
+python -m probe_runner.plots.plot_trajectory_domains --model llada2 --pair 0 1
+python -m probe_runner.plots.plot_trajectory_domains --model llada2 --pair 1 3
+
+# C — refresh recovery (cadence knee); add --partial_depth for C15 (needs model)
+python -m probe_runner.plots.plot_refresh_recovery --model llada2
+python -m probe_runner.plots.plot_refresh_recovery --model llada2 \
+    --partial_depth --model_path /path/to/DMax-Math-16B
+
+# B — repairability (needs the trained ThinkTalk checkpoint)
+python -m probe_runner.plots.plot_repairability --model llada2 \
+    --talk_ckpt /path/to/global_step_XXXX/hf_ckpt
+```
+
+**Offline check (no torch / GPU / model needed)** — the analysis logic is
+covered by a synthetic regression test:
+
+```bash
+python -m probe_runner.tests.test_trajectory_analyses
+```
 
 ---
 

@@ -42,12 +42,24 @@ def _find_dream_layers(model: nn.Module) -> list[nn.Module]:
     return out
 
 
+def _find_llada2_blocks(model: nn.Module) -> list[nn.Module]:
+    """Return list of LLaDA2MoeDecoderLayer instances in document order."""
+    out = []
+    for m in model.modules():
+        if type(m).__name__ == "LLaDA2MoeDecoderLayer":
+            out.append(m)
+    return out
+
+
 def _find_embedding(model: nn.Module) -> nn.Module:
     """Return the input token-embedding module."""
     # LLaDA: model.model.transformer.wte ; Dream: model.model.embed_tokens
     candidates = []
     for name, mod in model.named_modules():
-        if isinstance(mod, nn.Embedding) and ("wte" in name or "embed_tokens" in name):
+        # LLaDA-1.0: ...wte ; Dream/HF: ...embed_tokens ; LLaDA-2.0: ...word_embeddings
+        if isinstance(mod, nn.Embedding) and (
+            "wte" in name or "embed_tokens" in name or "word_embeddings" in name
+        ):
             candidates.append((name, mod))
     if not candidates:
         # Fallback: any nn.Embedding at the top of the model.
@@ -107,6 +119,7 @@ class _IntraPassBuffer:
     h: list[torch.Tensor] = field(default_factory=list)
     token_state: torch.Tensor | None = None
     revealed_this_pass: torch.Tensor | None = None
+    committed_tokens: torch.Tensor | None = None  # [num_masked] long, pre-pass block ids (mask_id where masked)
 
 
 class ProbeHooks:
@@ -192,6 +205,8 @@ class ProbeHooks:
             self._install_llada(model)
         elif model_type == "dream":
             self._install_dream(model)
+        elif model_type == "llada2":
+            self._install_llada2(model)
         else:
             raise ValueError(f"Unknown model_type: {model_type}")
 
@@ -221,6 +236,7 @@ class ProbeHooks:
         *,
         token_state: torch.Tensor | None = None,
         indices: list[int] | None = None,
+        committed_tokens: torch.Tensor | None = None,
     ) -> None:
         """Tag the next forward as belonging to (block_idx, pass_idx).
 
@@ -243,6 +259,8 @@ class ProbeHooks:
             buf = _IntraPassBuffer()
             if token_state is not None:
                 buf.token_state = token_state.detach().to(torch.int8).cpu()
+            if committed_tokens is not None:
+                buf.committed_tokens = committed_tokens.detach().to(torch.long).cpu()
             self._intra_buffers.setdefault(block_idx, {})[pass_idx] = buf
 
     def finalize_pass(self, revealed_this_pass: torch.Tensor | None = None) -> None:
@@ -300,21 +318,30 @@ class ProbeHooks:
             sorted_passes = [p for p in sorted_passes if pass_map[p].h]
             if not sorted_passes:
                 continue
+            num_masked = len(self.masked_positions or [])
             h_stacks = []
             ts_list, rv_list = [], []
+            has_committed = any(pass_map[p].committed_tokens is not None for p in sorted_passes)
+            ct_list = [] if has_committed else None
             for p in sorted_passes:
                 buf = pass_map[p]
                 h_stacks.append(torch.stack(buf.h, dim=0))  # [L+1, num_masked, d_model]
                 ts_list.append(buf.token_state if buf.token_state is not None
-                               else torch.zeros(len(self.masked_positions or []), dtype=torch.int8))
+                               else torch.zeros(num_masked, dtype=torch.int8))
                 rv_list.append(buf.revealed_this_pass if buf.revealed_this_pass is not None
-                               else torch.zeros(len(self.masked_positions or []), dtype=torch.bool))
-            out[block_idx] = {
+                               else torch.zeros(num_masked, dtype=torch.bool))
+                if has_committed:
+                    ct_list.append(buf.committed_tokens if buf.committed_tokens is not None
+                                   else torch.full((num_masked,), -1, dtype=torch.long))
+            entry = {
                 "h_per_pass":           torch.stack(h_stacks, dim=0),
                 "token_state_per_pass": torch.stack(ts_list, dim=0),
                 "revealed_per_pass":    torch.stack(rv_list, dim=0),
                 "pass_indices":         torch.tensor(sorted_passes, dtype=torch.int32),
             }
+            if has_committed:
+                entry["committed_tokens_per_pass"] = torch.stack(ct_list, dim=0)  # [n_passes, num_masked]
+            out[block_idx] = entry
         return out
 
     def remove(self) -> None:
@@ -576,6 +603,126 @@ class ProbeHooks:
             attn_output = attn_module.o_proj(attn_output)
 
             return attn_output, None, new_past_key_value
+
+        attn_module.forward = patched_forward
+        self._patched_objs.append((attn_module, "forward", original_forward))
+
+    # ---- LLaDA-2.0-MoE installation (LLaDA-2.0-mini / DMax-Math-16B) ----
+
+    def _install_llada2(self, model: nn.Module) -> None:
+        """Hook the residual stream of every LLaDA2MoeDecoderLayer + the embedding.
+
+        The hidden-state capture (the critical path for the refresh/repair
+        probe) is just the block forward hook — robust and arch-agnostic. The
+        attention/v_norm capture is best-effort: it reuses the model's OWN
+        attention math by forcing `output_attentions=True` on the original
+        forward (so we don't re-derive partial-RoPE + per-head q/k RMSNorm),
+        and only fires when the model was loaded with an eager attention impl
+        that actually returns weights.
+        """
+        blocks = _find_llada2_blocks(model)
+        if len(blocks) == 0:
+            raise RuntimeError("No LLaDA2MoeDecoderLayer instances found in model.")
+        self.n_layers = len(blocks)
+
+        # Only patch attention when the model is loaded EAGER — forcing
+        # output_attentions=True on an SDPA/flash module can raise and would
+        # break the (critical) hidden-state capture. sdpa runs capture
+        # hidden-only via the block hook, which is all the core metrics need.
+        attn_impl = str(getattr(getattr(model, "config", None), "_attn_implementation", "")).lower()
+        patch_attn = attn_impl == "eager"
+        if not patch_attn:
+            print(f"[hooks.llada2] attn_implementation={attn_impl!r}: capturing hidden "
+                  f"states only (load eager to also capture attn/v_norm).")
+
+        for layer_idx, layer in enumerate(blocks):
+            # The attention submodule on a LLaDA2MoeDecoderLayer is `.attention`
+            # (NOT `.self_attn` as on Dream / HF-Llama).
+            if patch_attn:
+                attn_module = getattr(layer, "attention", None) or getattr(layer, "self_attn", None)
+                if attn_module is not None:
+                    self._patch_llada2_attention(attn_module, layer_idx)
+            self._handles.append(layer.register_forward_hook(self._make_block_hook(layer_idx)))
+
+        embed = _find_embedding(model)
+        self._handles.append(embed.register_forward_hook(self._make_embed_hook()))
+
+    def _patch_llada2_attention(self, attn_module: nn.Module, layer_idx: int) -> None:
+        """Capture masked-position attn weights + (best-effort) v_norm for one layer.
+
+        Strategy: when armed at pass 0, call the *original* forward with
+        `output_attentions=True` to get the exact [B,H,L,L] weights the model
+        computes (this sidesteps re-deriving the fused-QKV split, per-head q/k
+        RMSNorm, and partial RoPE). v_norm is recomputed from a bare V
+        projection (V is not RoPE'd) through the `dense` output proj.
+        """
+        original_forward = attn_module.forward
+        n_heads = int(getattr(attn_module, "num_heads"))
+        n_kv_heads = int(getattr(attn_module, "num_key_value_heads", n_heads))
+        d_head = int(getattr(attn_module, "head_dim"))
+        # Output proj on LLaDA-2.0 is `dense` (NOT `o_proj`); weight [d_model, H*d_head].
+        out_proj = getattr(attn_module, "dense", None) or getattr(attn_module, "o_proj", None)
+        qkv_proj = getattr(attn_module, "query_key_value", None)
+        W_O_per_head = None
+        if out_proj is not None:
+            W_O = out_proj.weight.detach()
+            d_model = W_O.size(0)
+            W_O_per_head = W_O.view(d_model, n_heads, d_head).permute(1, 2, 0).contiguous()
+
+        hooks_self = self
+        warned = {"done": False}
+
+        def patched_forward(hidden_states, attention_mask=None, position_ids=None,
+                            past_key_value=None, output_attentions=False, use_cache=False,
+                            position_embeddings=None, **kwargs):
+            capture_attn = (
+                hooks_self.armed
+                and hooks_self.current_block is not None
+                and (hooks_self.current_pass is None or hooks_self.current_pass == 0)
+            )
+            if not capture_attn:
+                return original_forward(
+                    hidden_states, attention_mask=attention_mask, position_ids=position_ids,
+                    past_key_value=past_key_value, output_attentions=output_attentions,
+                    use_cache=use_cache, position_embeddings=position_embeddings, **kwargs,
+                )
+
+            # Reuse the model's own attention math; force weights out.
+            out, attn_w, pkv = original_forward(
+                hidden_states, attention_mask=attention_mask, position_ids=position_ids,
+                past_key_value=past_key_value, output_attentions=True,
+                use_cache=use_cache, position_embeddings=position_embeddings, **kwargs,
+            )
+
+            buf = hooks_self._buffers[hooks_self.current_block]
+            masked_pos = hooks_self.masked_positions
+            if attn_w is not None and masked_pos is not None:
+                # [B,H,Tq,Tk] -> [H, num_masked, Tk] (mirror the dream layout).
+                attn_at_m = attn_w[0, :, masked_pos, :].to(torch.float16).cpu()
+                buf.attn.append(attn_at_m)
+                # v_norm: bare V projection (no RoPE), GQA-broadcast, through W_O.
+                if hooks_self.record_v_norm and W_O_per_head is not None and qkv_proj is not None:
+                    try:
+                        bsz, q_len, _ = hidden_states.shape
+                        qkv = qkv_proj(hidden_states).view(
+                            bsz, q_len, n_heads + 2 * n_kv_heads, d_head)
+                        v = qkv[:, :, n_heads + n_kv_heads:, :].transpose(1, 2)  # [B,nkv,Tq,d]
+                        if n_heads != n_kv_heads:
+                            v = v.repeat_interleave(n_heads // n_kv_heads, dim=1,
+                                                    output_size=n_heads)
+                        wov = torch.einsum(
+                            "hkd,htk->htd",
+                            W_O_per_head.to(v.dtype).to(v.device), v[0])
+                        buf.v_norm.append(wov.norm(dim=-1).to(torch.float32).cpu())  # [H,Tq]
+                    except Exception:
+                        pass
+            elif not warned["done"]:
+                warned["done"] = True
+                print("[hooks.llada2] attention weights unavailable "
+                      "(load with attn_implementation='eager' to capture attn/v_norm); "
+                      "hidden-state capture is unaffected.")
+
+            return out, (attn_w if output_attentions else None), pkv
 
         attn_module.forward = patched_forward
         self._patched_objs.append((attn_module, "forward", original_forward))
