@@ -64,11 +64,13 @@ def build(root: str | Path, *, n_samples: int = 4, num_blocks: int = 2,
                 converged = rng.integers(0, vocab, size=B)            # final tokens
                 distractor = rng.integers(0, vocab, size=B)           # what masked positions lean to
 
-                # commit schedule: ~B/P positions per pass, left to right.
-                # n_committed_before_pass[k] = how many positions are committed
-                # at the INPUT of pass k.
-                committed_before = np.linspace(0, B, P, dtype=int)    # [P], 0..B
-                # CR event: position 0 committed WRONG from pass 1, revised at pass 3.
+                # commit schedule, left-to-right. schedule[k] = #committed at the
+                # INPUT of pass k (schedule[0]=0 → pass 0 sees all-mask; schedule[P]=B).
+                # revealed_per_pass[k] = positions committed DURING pass k (matches
+                # the runner), so pass 0 commits a real prefix.
+                schedule = np.linspace(0, B, P + 1).astype(int)       # [P+1]
+                idx = np.arange(B)
+                # CR event: position 0 committed WRONG while masked-free, revised at pass 3.
                 wrong_tok = (converged[0] + 7) % vocab
 
                 ct_per_pass = np.full((P, B), MASK_ID, dtype=np.int64)
@@ -76,18 +78,15 @@ def build(root: str | Path, *, n_samples: int = 4, num_blocks: int = 2,
                 rv_per_pass = np.zeros((P, B), dtype=bool)
                 h_per_pass = np.zeros((P, L + 1, B, D), dtype=np.float32)
 
-                prev_committed = np.zeros(B, dtype=bool)
                 for k in range(P):
-                    n_c = int(committed_before[k])
-                    committed = np.arange(B) < n_c                    # input state at pass k
-                    # token ids fed into pass k
+                    committed = idx < schedule[k]                     # input state at pass k
+                    revealed_now = (idx >= schedule[k]) & (idx < schedule[k + 1])
                     toks = np.where(committed, converged, MASK_ID).astype(np.int64)
                     if committed[0] and k < 3:
                         toks[0] = wrong_tok                            # CR: wrong until pass 3
                     ct_per_pass[k] = toks
                     ts_per_pass[k] = committed.astype(np.int8)
-                    rv_per_pass[k] = committed & (~prev_committed)     # newly committed this input
-                    prev_committed = committed
+                    rv_per_pass[k] = revealed_now
 
                     # ---- hidden ----
                     # what the model "leans toward" at this pass, per position

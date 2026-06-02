@@ -41,6 +41,13 @@ def _check_rank(root):
     assert 0.0 <= frac1 <= 1.0
     rank.plot(stats, Path(root) / "llada2" / "plots", "llada2")
     print(f"  [rank] descends {first:.2f}→{last:.2f} log10; oracle top-1@0={frac1:.1%}  OK")
+    # rank-by-domain: both groups should populate (synthetic commits a pass-0 prefix)
+    assert stats["pass0_committed"].size > 0, "expected think-committed@0 positions"
+    assert stats["pass0_masked"].size > 0, "expected left-for-talk positions"
+    rank.plot_by_domain(stats, Path(root) / "llada2" / "plots", "llada2")
+    hard_top10 = float((stats["pass0_masked"] <= 10).mean())
+    print(f"  [rank-by-domain] committed@0={stats['pass0_committed'].size} "
+          f"left-for-talk={stats['pass0_masked'].size} (top-10 ceiling {hard_top10:.0%})  OK")
 
 
 def _check_domains(root):
