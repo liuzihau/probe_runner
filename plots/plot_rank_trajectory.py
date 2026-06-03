@@ -68,6 +68,14 @@ def accumulate(probes_root: Path, model: str, head: tc.RankHead,
     # heatmap accumulators [Pmax, B]
     rank_sum = None
     rank_cnt = None
+    # per-(pass x pos) committed fraction — generalizes the "decoded boundary" to
+    # NON-contiguous decode. DMax decode_uniform commits a left-to-right prefix, so
+    # #committed == boundary position; LLaDA-2.0 native threshold decode commits a
+    # GLOBAL (scattered) set, so there is no L->R boundary and we draw a frontier.
+    cstate_sum = None
+    cstate_cnt = None
+    contig_hit = 0.0          # passes whose committed set is a left-aligned prefix
+    contig_tot = 0.0
     # top-K hit per pass, overall + by committed/masked
     hit = {k: {"all": None, "committed": None, "masked": None} for k in TOPK}
     cnt = {"all": None, "committed": None, "masked": None}
@@ -124,6 +132,8 @@ def accumulate(probes_root: Path, model: str, head: tc.RankHead,
             Pmax, Bmax = max(Pmax, P), max(Bmax, B)
             rank_sum = _ensure(rank_sum, Pmax, Bmax)
             rank_cnt = _ensure(rank_cnt, Pmax, Bmax)
+            cstate_sum = _ensure(cstate_sum, Pmax, Bmax)
+            cstate_cnt = _ensure(cstate_cnt, Pmax, Bmax)
             for k in TOPK:
                 for g in ("all", "committed", "masked"):
                     hit[k][g] = _ensure1(hit[k][g], Pmax)
@@ -143,6 +153,17 @@ def accumulate(probes_root: Path, model: str, head: tc.RankHead,
                 cnt["committed"][p] += int((committed[p] & vmask).sum())
                 cnt["masked"][p] += int(((~committed[p]) & vmask).sum())
                 s_cnt[p] += int(vmask.sum())
+                # committed fraction by (pass, pos) over all EOS-valid positions,
+                # plus a contiguity check (is the committed set a left-aligned
+                # prefix?) to decide the heatmap overlay (staircase vs frontier).
+                cstate_sum[p, :B][valid] += committed[p][valid].astype(np.float64)
+                cstate_cnt[p, :B][valid] += 1.0
+                cm = committed[p] & valid
+                mm = (~committed[p]) & valid
+                if cm.any() and mm.any():
+                    contig_tot += 1.0
+                    if int(np.where(cm)[0].max()) < int(np.where(mm)[0].min()):
+                        contig_hit += 1.0
                 for k in TOPK:
                     intopk = vmask & (vr <= k)
                     hit[k]["all"][p] += int(intopk.sum())
@@ -178,9 +199,18 @@ def accumulate(probes_root: Path, model: str, head: tc.RankHead,
     def _cat(lst):
         return np.concatenate(lst) if lst else np.array([], dtype=np.int64)
 
+    with np.errstate(invalid="ignore", divide="ignore"):
+        commit_frac = (np.where(cstate_cnt > 0, cstate_sum / np.maximum(cstate_cnt, 1), np.nan)
+                       if cstate_sum is not None else None)
+    # >=90% of mixed passes left-aligned  => treat as contiguous (DMax). Otherwise
+    # the decode is scattered (LLaDA-2.0 native threshold) and the L->R staircase
+    # is meaningless, so the heatmap falls back to a committed-fraction frontier.
+    is_contiguous = (contig_tot == 0) or (contig_hit / max(contig_tot, 1.0) >= 0.9)
+
     return {
         "rank_sum": rank_sum, "rank_cnt": rank_cnt,
         "hit": hit, "cnt": cnt, "rates": rates, "commit": commit,
+        "commit_frac": commit_frac, "is_contiguous": bool(is_contiguous),
         "pass0": _cat(pass0_ranks),
         "pass0_committed": _cat(pass0_committed),
         "pass0_masked": _cat(pass0_masked),
@@ -210,11 +240,15 @@ def plot(stats: dict, out_dir: Path, model: str) -> None:
     ax.set_xlabel("position in block")
     ax.set_ylabel("decode pass")
     fig.colorbar(im, ax=ax, label="mean log10(rank)  (low = model already knows)")
-    # Contour: at each pass, the average number of committed (decoded) tokens.
-    # Left of the staircase = already decoded; right = still masked. Left-to-right
-    # contiguous decode ⇒ #committed is exactly the boundary position.
+    # Overlay the committed/masked frontier. For a LEFT-TO-RIGHT contiguous decode
+    # (DMax decode_uniform) #committed is exactly the boundary position, so we draw
+    # the staircase (left = decoded). For a NON-contiguous decode (LLaDA-2.0 native
+    # threshold: scattered global commits) there is no L->R boundary, so we instead
+    # contour the per-(pass,pos) 50%-committed frontier.
     commit = stats.get("commit")
-    if commit is not None and commit.size:
+    is_contig = stats.get("is_contiguous", True)
+    cfrac = stats.get("commit_frac")
+    if is_contig and commit is not None and commit.size:
         with np.errstate(invalid="ignore"):
             avg_commit = np.nanmean(commit, axis=0)        # [Pmax]
         boundary = avg_commit - 0.5                          # right edge of last committed
@@ -228,6 +262,13 @@ def plot(stats: dict, out_dir: Path, model: str) -> None:
             ax.plot(xs_c, ys_c, color="red", lw=1.6,
                     label="avg #committed (left = decoded)")
             ax.legend(loc="upper left", fontsize=7, framealpha=0.75)
+    elif cfrac is not None and np.isfinite(cfrac).any():
+        P_, B_ = cfrac.shape
+        ax.contour(np.arange(B_), np.arange(P_), np.nan_to_num(cfrac, nan=0.0),
+                   levels=[0.5], colors="red", linewidths=1.4)
+        ax.plot([], [], color="red", lw=1.4,
+                label="50%-committed frontier (non-contiguous decode)")
+        ax.legend(loc="upper left", fontsize=7, framealpha=0.75)
 
     # (2) top-K hit-rate vs pass, with 95% CI shading across samples
     ax = axes[1]
@@ -318,19 +359,34 @@ def plot_by_domain(stats: dict, out_dir: Path, model: str) -> None:
                     alpha=a, label=f"{group} top-{K}")
     ax.set_ylim(0, 1.02)
     ax.set_title("top-K hit-rate vs pass, by state\n"
-                 "(masked = still-undecoded hard tail at that pass)")
+                 "(masked = undecided at the START of each pass — PRE-commit)")
     ax.set_xlabel("decode pass")
     ax.set_ylabel("fraction with converged token in top-K")
     ax.grid(alpha=0.3)
     ax.legend(fontsize=7, ncol=2, loc="lower right")
+
+    # Recovery readout. The masked group at the start of pass 1 is exactly the
+    # right panel's left-for-talk set (the hard tail think left after iter 0). So
+    # pass0_masked top-1 (panel B, iter-0 forward) vs masked@pass1 top-1 (iter-1
+    # forward) is a same-set comparison: how much one extra THINK pass recovers.
+    pm = stats["pass0_masked"]
+    m1 = rate("masked", 1)
+    if pm.size and m1.size > 1 and np.isfinite(m1[1]):
+        a0, a1 = float((pm <= 1).mean()), float(m1[1])
+        ax.text(0.97, 0.05,
+                "hard tail (left-for-talk) top-1:\n"
+                f"  iter0 = {a0:.0%}  ->  iter1 = {a1:.0%}\n"
+                "  (recovered via a 2nd THINK pass)",
+                transform=ax.transAxes, ha="right", va="bottom", fontsize=8,
+                family="monospace", bbox=dict(boxstyle="round", fc="white", alpha=0.85))
 
     # Panel B: pass-0 hard-tail ceiling (the headline).
     ax = axes[1]
     pm, pc = stats["pass0_masked"], stats["pass0_committed"]
     vocab = stats["vocab"]
     ntot = pm.size + pc.size
-    for arr, lab, col in ((pc, "think-committed @0", "tab:green"),
-                          (pm, "left for talk @0 (hard tail)", "tab:red")):
+    for arr, lab, col in ((pc, "think-committed @0 (POST-commit)", "tab:green"),
+                          (pm, "left-for-talk (undecided AFTER iter 0)", "tab:red")):
         if arr.size:
             ax.hist(np.log10(np.maximum(arr, 1)), bins=30, density=True, alpha=0.5,
                     color=col, label=f"{lab}  (n={arr.size})")
@@ -350,8 +406,10 @@ def plot_by_domain(stats: dict, out_dir: Path, model: str) -> None:
     ax.set_ylabel("density")
     ax.legend(fontsize=8, loc="upper left")
 
-    fig.suptitle(f"{model}: A7 rank by domain  [n_samples={stats['n_samples']}]  "
-                 f"— the left-for-talk ceiling is the talk's headroom over its ~0.20")
+    fig.suptitle(
+        f"{model}: A7 rank by domain  [n_samples={stats['n_samples']}]\n"
+        "LEFT: masked = undecided at START of pass (PRE-commit)   |   "
+        "RIGHT: split by think's iter-0 commit (POST-commit hard tail)")
     fig.tight_layout()
     p = out_dir / "rank_by_domain.png"
     fig.savefig(p, dpi=130, bbox_inches="tight")
