@@ -44,10 +44,18 @@ substrate for every analysis):
 python -m probe_runner.run_probes --model llada2 --intra_block \
     --model_path /path/to/DMax-Math-16B --decode_mode soft
 
-# LLaDA-2.0-mini, threshold decode (hard commit, no CR):
+# LLaDA-2.0-mini, NATIVE threshold decode (global confidence-threshold parallel,
+# hard commit, no CR; threshold auto-defaults to 0.9):
 python -m probe_runner.run_probes --model llada2 --intra_block \
-    --model_path /path/to/LLaDA2.0-mini-moe-merge --decode_mode hard
+    --model_path /path/to/LLaDA2.0-mini-moe-merge --decode_mode threshold
 ```
+
+> **Decode modes.** `soft` = DMax `decode_uniform` (contiguous prefix + soft mix,
+> threshold 0.3, the CR domain is live). `threshold` = **LLaDA-2.0-mini's native
+> decode** (`get_transfer_index_threshold`: global confidence-threshold *parallel*
+> commit, hard token-id input, fixed commits, threshold 0.9) — use this for the
+> mini baseline. `hard` is a contiguous-prefix + hard-commit *diagnostic*, not a
+> shipped decode.
 
 This writes `probes_out/llada2/sample_*.h5` (with `committed_tokens_per_pass`
 and `converged_tokens`) plus `probes_out/llada2/lm_head.pt` — the final-norm +

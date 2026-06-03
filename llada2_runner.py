@@ -16,13 +16,21 @@ with two deliberate simplifications for a probe:
     commit, soft-embedding mix, block-causal mask) is identical, which is what
     the trajectory depends on.
 
-Two decode modes (see T3-DMax handoff §5 / the design doc §1):
+Three decode modes:
 
-  * ``decode_mode="soft"`` (**DMax** ``decode_uniform``): committed positions
-    are fed back as a soft embedding mix ``p·e(top1) + (1-p)·e(mask)`` and are
-    **re-argmax'd every pass** → a commit can flip → the **CR** domain is live.
-  * ``decode_mode="hard"`` (**LLaDA-2.0-mini** threshold decode): committed
-    positions are hard token embeddings and **fixed** once committed → no CR.
+  * ``decode_mode="soft"`` (**DMax** ``decode_uniform``): left-to-right
+    *contiguous-prefix* commit (threshold 0.3) + soft embedding mix
+    ``p·e(top1) + (1-p)·e(mask)``, committed positions **re-argmax'd every pass**
+    → a commit can flip → the **CR** domain is live.
+  * ``decode_mode="threshold"`` (**LLaDA-2.0-mini NATIVE**;
+    ``get_transfer_index_threshold``): **global** confidence-threshold *parallel*
+    commit — every masked position with argmax confidence ≥ ``min(threshold,
+    max_conf)``, anywhere in the block (not a prefix); hard token-id input;
+    committed positions **fixed** (no CR). dInfer's default threshold is **0.9**.
+    *Use this for the LLaDA-2.0-mini baseline.*
+  * ``decode_mode="hard"`` (**diagnostic — NOT a native decode**): the contiguous
+    prefix of ``soft`` but with hard embeddings and fixed commits. A controlled
+    midpoint; not what any shipped model runs.
 
 Loads ``LLaDA2MoeModelLM`` from the T3-DMax checkout (resolved via
 ``configs.add_llada2_to_path``).
@@ -157,6 +165,29 @@ def _commit_uniform(block_logits: torch.Tensor, block_x: torch.Tensor,
     return x0, high_conf_index, max_probs
 
 
+def _commit_threshold(block_logits: torch.Tensor, block_x: torch.Tensor,
+                      mask_id: int, threshold: float):
+    """LLaDA-2.0-mini native commit (get_transfer_index_threshold).
+
+    GLOBAL confidence-threshold parallel: commit every masked position whose
+    argmax confidence ≥ min(threshold, max_conf) — anywhere in the block, not a
+    left-to-right prefix. The clamp to max_conf guarantees ≥1 commit per pass.
+    Returns (x0, transfer_index [1,B] bool = newly committable, max_probs).
+    """
+    probs = torch.softmax(block_logits.float(), dim=-1)
+    max_probs, x0 = probs.max(dim=-1)                                   # [1, B]
+    mask_index = (block_x == mask_id)
+    # rm_mask=True (dInfer default): never commit a position whose argmax IS the
+    # mask token — such positions stay masked this pass.
+    mask_index = mask_index & (x0 != mask_id)
+    neg_inf = torch.full_like(max_probs, float("-inf"))
+    confidence = torch.where(mask_index, max_probs, neg_inf)
+    # effective threshold = min(max_conf - eps, threshold); ≥-1000 floor (matches dInfer)
+    actual_threshold = (confidence.max(dim=1, keepdim=True)[0] - 1e-5).clamp(-1000.0, threshold)
+    transfer_index = (confidence >= actual_threshold) & mask_index
+    return x0, transfer_index, max_probs
+
+
 def _build_block_soft_embeds(block_ids: torch.Tensor, max_probs: torch.Tensor,
                              x0: torch.Tensor, soft_cond: torch.Tensor,
                              embedding_layer, mask_id: int) -> torch.Tensor:
@@ -247,7 +278,7 @@ def generate_with_probes(
 
     Returns (x, nfe).
     """
-    assert decode_mode in ("soft", "hard")
+    assert decode_mode in ("soft", "hard", "threshold")
     device = next(model.parameters()).device
     dtype = next(model.parameters()).dtype
     if prompt.device != device:
@@ -299,36 +330,46 @@ def generate_with_probes(
 
             block_x = x[:, s:e]
             mask_index = (block_x == mask_id)
-            x0, high_conf_index, max_probs = _commit_uniform(
-                block_logits, block_x, mask_id, commit_threshold)
-
-            # Update rule. soft (DMax): also re-argmax already-committed
-            # positions (active & ~mask) → commits can be revised (CR).
-            active_committed = (~mask_index)
-            if decode_mode == "soft":
-                update_mask = high_conf_index | active_committed
+            if decode_mode == "threshold":
+                # LLaDA-2.0-mini native: global confidence-threshold parallel,
+                # hard token-id input, committed positions fixed.
+                x0, commit_index, max_probs = _commit_threshold(
+                    block_logits, block_x, mask_id, commit_threshold)
+                update_mask = commit_index                            # only newly committed
             else:
-                update_mask = high_conf_index
+                # decode_uniform left-to-right contiguous prefix.
+                x0, commit_index, max_probs = _commit_uniform(
+                    block_logits, block_x, mask_id, commit_threshold)
+                if decode_mode == "soft":
+                    # DMax: also re-argmax already-committed positions → CR.
+                    update_mask = commit_index | (~mask_index)
+                else:  # "hard": contiguous prefix, fixed commit (diagnostic, not native)
+                    update_mask = commit_index
             changed = update_mask & (x0 != block_x)
             new_block = block_x.clone()
             new_block[update_mask] = x0[update_mask]
             x[:, s:e] = new_block
 
-            revealed_blk = (mask_index & high_conf_index)[0].to(torch.bool)  # mask→committed this pass
+            revealed_blk = (mask_index & commit_index)[0].to(torch.bool)  # mask→committed this pass
             if intra_block and on_pass_end is not None:
                 on_pass_end(nb, i, revealed_blk)
             elif not intra_block and i == 0:
                 # Legacy contract: capture pass 0 only, then disarm.
                 on_block_end(nb)
 
-            # Early stop (decode_uniform Breakflag): all positions confident, or
-            # nothing changed this pass.
-            conf_ok = bool((max_probs >= break_threshold).all())
+            # Early stop. soft (DMax Breakflag): all active confident, or no change.
+            # threshold/hard: block fully decoded, or no change.
+            all_committed = bool((x[:, s:e] == mask_id).sum() == 0)
             no_change = not bool(changed.any())
-            if conf_ok or no_change:
+            if decode_mode == "soft":
+                stop = bool((max_probs >= break_threshold).all()) or no_change
+            else:
+                stop = all_committed or no_change
+            if stop:
                 break
 
-            # Build next pass's soft embeds (soft mode only).
+            # Build next pass's soft embeds (soft mode only; threshold/hard feed
+            # hard token-id embeddings, so block_soft stays None).
             if decode_mode == "soft":
                 soft_cond = (x[0, s:e] != mask_id)                     # committed after this pass
                 block_soft = _build_block_soft_embeds(

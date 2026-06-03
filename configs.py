@@ -44,12 +44,14 @@ PROBE_CONFIG = {
             "mask_token_id": 156895,
             "eos_token_id": 156892,
             "pad_token_id": 156892,
-            # decode rule: "soft" = DMax decode_uniform (soft-embedding mix,
-            # committed positions re-argmax'd each pass → CR domain live);
-            # "hard" = LLaDA-2.0-mini threshold decode (hard commit, no CR).
+            # decode rule: "soft" = DMax decode_uniform (contiguous prefix + soft
+            # mix, committed re-argmax'd each pass → CR domain live, threshold 0.3);
+            # "threshold" = LLaDA-2.0-mini NATIVE (global confidence-threshold
+            # parallel, hard token-id input, committed fixed, threshold 0.9) — the
+            # mini baseline; "hard" = contiguous+hard diagnostic (not native).
             "decode_mode": "soft",
-            "commit_threshold": 0.3,   # DMax decode_uniform commit threshold
-            "break_threshold": 0.9,    # early-stop when all active conf >= this
+            "commit_threshold": 0.3,   # DMax decode_uniform default (mini threshold uses 0.9)
+            "break_threshold": 0.9,    # early-stop when all active conf >= this (soft mode)
         },
     },
     "dataset": {

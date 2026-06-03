@@ -154,13 +154,18 @@ def run_for_model(model_type: str, *, n_samples: int = 100, output_root: Path | 
                   t3dmax_root: str | Path | None = None,
                   attn_impl: str = "sdpa",
                   decode_mode: str = "soft",
-                  commit_threshold: float = 0.3,
+                  commit_threshold: float | None = None,
                   break_threshold: float = 0.9,
                   max_iter_per_block: int | None = None,
                   export_head: bool = True) -> dict:
     output_root = output_root or Path(configs.PROBE_CONFIG["output"]["root"])
     out_dir = output_root / model_type
     out_dir.mkdir(parents=True, exist_ok=True)
+
+    # Commit threshold default depends on the decode rule: DMax decode_uniform
+    # uses 0.3; LLaDA-2.0-mini's native threshold decode uses 0.9 (dInfer default).
+    if commit_threshold is None:
+        commit_threshold = 0.9 if decode_mode == "threshold" else 0.3
 
     eos_token_id = None
 
@@ -463,11 +468,15 @@ def main():
     parser.add_argument("--attn_impl", choices=["sdpa", "eager"], default="sdpa",
                         help="llada2 attention impl. 'eager' lets the probe capture "
                              "attn/v_norm; 'sdpa' (default) is faster, hidden-only.")
-    parser.add_argument("--decode_mode", choices=["soft", "hard"], default="soft",
-                        help="llada2 decode rule: 'soft' = DMax decode_uniform "
-                             "(revisable commits → CR domain); 'hard' = LLaDA-2.0-mini "
-                             "threshold decode (fixed commits).")
-    parser.add_argument("--commit_threshold", type=float, default=0.3)
+    parser.add_argument("--decode_mode", choices=["soft", "threshold", "hard"], default="soft",
+                        help="llada2 decode rule. 'soft' = DMax decode_uniform "
+                             "(contiguous prefix + soft mix, revisable → CR domain); "
+                             "'threshold' = LLaDA-2.0-mini NATIVE (global confidence-"
+                             "threshold parallel, hard, fixed) — USE FOR THE MINI BASELINE; "
+                             "'hard' = contiguous+hard diagnostic (not a native decode).")
+    parser.add_argument("--commit_threshold", type=float, default=None,
+                        help="Commit threshold. Default: 0.3 for soft/hard (DMax "
+                             "decode_uniform), 0.9 for threshold (mini native).")
     parser.add_argument("--break_threshold", type=float, default=0.9)
     parser.add_argument("--max_iter_per_block", type=int, default=None)
     parser.add_argument("--no_export_head", action="store_true",
