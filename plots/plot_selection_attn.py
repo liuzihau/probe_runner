@@ -117,6 +117,17 @@ def compute_block_inputs(probes_root, model: str, head: tc.RankHead, K: int,
 
 # ---- attention selection head (torch) ---------------------------------------
 
+def _sinusoid(n: int, d: int, device):
+    import torch
+    pos = torch.arange(n, device=device).float().unsqueeze(1)        # [n,1]
+    j = torch.arange(d, device=device).float().unsqueeze(0)          # [1,d]
+    angle = pos / (10000.0 ** (2.0 * (j // 2) / d))
+    pe = torch.zeros(n, d, device=device)
+    pe[:, 0::2] = torch.sin(angle[:, 0::2])
+    pe[:, 1::2] = torch.cos(angle[:, 1::2])
+    return pe                                                        # [n,d]
+
+
 def _build_model(D: int, d_attn: int, n_heads: int, n_layers: int):
     import torch
     import torch.nn as nn
@@ -125,10 +136,12 @@ def _build_model(D: int, d_attn: int, n_heads: int, n_layers: int):
         def __init__(self):
             super().__init__()
             self.q = nn.Linear(D, d_attn)
-            self.kv = nn.Linear(D, d_attn)
-            # a learned null key/value (token-free) so every query has ≥1 valid key
-            # even with no revealed neighbor — avoids NaN softmax without leaking.
-            self.null = nn.Parameter(torch.zeros(1, 1, d_attn))
+            self.k = nn.Linear(D, d_attn)         # keys: routing (get positional encoding)
+            self.v = nn.Linear(D, d_attn)         # values: token content (no positions)
+            # learned null key+value (token-free) so every query has ≥1 valid key even
+            # with no revealed neighbor — avoids NaN softmax without leaking.
+            self.null_k = nn.Parameter(torch.zeros(1, 1, d_attn))
+            self.null_v = nn.Parameter(torch.zeros(1, 1, d_attn))
             self.layers = nn.ModuleList([
                 nn.MultiheadAttention(d_attn, n_heads, batch_first=True) for _ in range(n_layers)])
             self.norms = nn.ModuleList([nn.LayerNorm(d_attn) for _ in range(n_layers)])
@@ -141,17 +154,20 @@ def _build_model(D: int, d_attn: int, n_heads: int, n_layers: int):
         def forward(self, z, zc, valid):
             # z,zc [b,B,D]; valid [b,B] bool. Returns u [b,B,D] = anchor + attn(neighbors).
             b, Bn, _ = z.shape
-            q = self.q(z)                                  # [b,B,d]
-            kv = torch.cat([self.null.expand(b, -1, -1), self.kv(zc)], dim=1)  # [b,1+B,d]
-            # column 0 = null (never masked); cols 1.. = neighbors.
-            # self-mask: query i cannot attend its own neighbor column (i+1).
-            attn_mask = torch.zeros(Bn, Bn + 1, device=z.device)
-            attn_mask[torch.arange(Bn), torch.arange(Bn) + 1] = float("-inf")
+            pe = _sinusoid(Bn, self.q.out_features, z.device).unsqueeze(0)  # [1,B,d]
+            q = self.q(z) + pe                                             # [b,B,d] (positioned)
+            K = torch.cat([self.null_k.expand(b, -1, -1), self.k(zc) + pe], dim=1)  # keys: positioned
+            V = torch.cat([self.null_v.expand(b, -1, -1), self.v(zc)], dim=1)       # values: token-only
+            # column 0 = null (never masked); cols 1.. = neighbors (position j → col j+1).
+            # self-mask: query i cannot attend its own column (i+1). Bool masks (same
+            # type as key_padding_mask): True = disallow.
+            attn_mask = torch.zeros(Bn, Bn + 1, dtype=torch.bool, device=z.device)
+            attn_mask[torch.arange(Bn), torch.arange(Bn) + 1] = True
             key_pad = torch.cat([torch.zeros(b, 1, dtype=torch.bool, device=z.device),
-                                 ~valid], dim=1)           # [b,1+B] True = ignore
+                                 ~valid], dim=1)                           # [b,1+B] True = ignore
             h = q
             for attn, norm in zip(self.layers, self.norms):
-                a, _ = attn(h, kv, kv, attn_mask=attn_mask, key_padding_mask=key_pad,
+                a, _ = attn(h, K, V, attn_mask=attn_mask, key_padding_mask=key_pad,
                             need_weights=False)
                 h = norm(h + torch.nan_to_num(a))
             return self.anchor(z) + self.out(h)            # [b,B,D]
@@ -294,8 +310,8 @@ def _selftest() -> None:
     nb, B, D, K, V = 80, 6, 16, 4, 40
     W = rng.standard_normal((V, D)).astype(np.float32)
     Wn = W / np.maximum(np.linalg.norm(W, axis=1, keepdims=True), 1e-8)
-    z = rng.standard_normal((nb, B, D)).astype(np.float16)       # anchor: uninformative
-    zc = np.zeros((nb, B, D), np.float16)
+    z = np.zeros((nb, B, D), np.float16)                         # anchor: deliberately empty,
+    zc = np.zeros((nb, B, D), np.float16)                        # so ALL signal is in neighbors
     cand = np.zeros((nb, B, K), np.int64); tgt = np.full((nb, B), -1, np.int64)
     r0 = np.full((nb, B), 5, np.int64); valid = np.ones((nb, B), bool)
     for s in range(nb):
@@ -313,7 +329,7 @@ def _selftest() -> None:
             "valid": valid, "pid": np.array([f"p{s%8}" for s in range(nb)]), "D": D, "K": K}
     head = tc.RankHead(W, np.ones(D, np.float32))               # only .W used for gather here
     res = train_attn(data, head, tail_only=False, d_attn=32, n_heads=2, n_layers=2,
-                     epochs=120, lr=3e-3, batch_blocks=16, device="cpu", seed=0)
+                     epochs=200, lr=5e-3, batch_blocks=16, device="cpu", seed=0)
     acc = res["tail"]["selection"]
     assert acc > 0.7, f"attn head should learn the neighbor-encoded target, got {acc:.2f}"
     print(f"plot_selection_attn selftest OK (neighbor-target acc={acc:.2f})")
