@@ -252,3 +252,37 @@ def find_head_export(probes_root: Path, model: str) -> Path | None:
         if p.exists():
             return p
     return None
+
+
+def progress_iter(iterable, total=None, desc="", min_interval=5.0):
+    """Yield items from `iterable`, showing progress + elapsed + ETA so long
+    model-driven loops report how far they are. Uses `tqdm` if importable; else
+    falls back to printing one line at most every `min_interval` seconds. Pure
+    Python (no torch); safe to wrap any loop."""
+    import time
+    try:
+        from tqdm import tqdm                       # nice single-line bar if available
+        yield from tqdm(iterable, total=total, desc=desc)
+        return
+    except Exception:
+        pass
+    if total is None:
+        try:
+            total = len(iterable)
+        except Exception:
+            total = None
+    t0 = time.time()
+    last = 0.0
+    n = 0
+    for x in iterable:
+        yield x
+        n += 1
+        now = time.time()
+        if now - last >= min_interval or (total and n >= total):
+            last = now
+            el = now - t0
+            rate = n / el if el > 0 else 0.0
+            eta = (total - n) / rate if (total and rate > 0) else float("nan")
+            tot = total if total is not None else "?"
+            print(f"  [{desc}] {n}/{tot}  elapsed={el:.0f}s  eta={eta:.0f}s  ({rate:.2f}/s)",
+                  flush=True)

@@ -242,7 +242,8 @@ def run_eval(model_path: str, problems: list, config_labels: list, *,
 
     res = {lbl: {"correct": 0, "total": 0, "cost": 0.0, "nfe": 0, "cut": L, "rethink": M}
            for lbl, L, M in cfgs}
-    for q, gold in problems[:n_problems]:
+    probs = problems[:n_problems]
+    for q, gold in tc.progress_iter(probs, total=len(probs), desc="GSM8K eval"):
         prompt = _format(q)
         Lp = int(prompt.shape[1])
         for lbl, L, M in cfgs:

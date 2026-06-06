@@ -116,7 +116,8 @@ def precompute_blocks(model, tokenizer, samples, *, block_length: int, n_samples
     blocks = []
     state["keep"] = None                                    # full model
     done = 0
-    for sample in samples:
+    for sample in tc.progress_iter(samples, total=min(n_samples or len(samples), len(samples)),
+                                   desc="precompute (full passes)"):
         attrs = sample["attrs"]
         q = attrs.get("prompt_text")
         q = q.decode() if isinstance(q, bytes) else q
@@ -184,9 +185,11 @@ def greedy_search(model, blocks, depth, extra, *, keep_first_last, block_length,
     keep = set(forced_layers(depth, keep_first_last))
     middle = [l for l in range(depth) if l not in keep]
     history = []
-    for _ in range(extra):
+    for r in range(extra):
+        cands = [c for c in middle if c not in keep]
         scored = [(c, subset_fidelity(model, blocks, keep | {c}, block_length=block_length,
-                                      device=device, state=state)) for c in middle if c not in keep]
+                                      device=device, state=state))
+                  for c in tc.progress_iter(cands, desc=f"greedy round {r+1}/{extra}")]
         c_best, f_best = max(scored, key=lambda kv: kv[1])
         keep.add(c_best)
         history.append({"added": c_best, "keep": tuple(sorted(keep)), "fidelity": f_best})
@@ -196,7 +199,8 @@ def greedy_search(model, blocks, depth, extra, *, keep_first_last, block_length,
 def exhaustive_search(model, blocks, depth, extra, *, keep_first_last, block_length, device, state):
     cands = enumerate_candidates(depth, extra, keep_first_last=keep_first_last)
     scored = [{"keep": k, "fidelity": subset_fidelity(model, blocks, k, block_length=block_length,
-                                                       device=device, state=state)} for k in cands]
+                                                       device=device, state=state)}
+              for k in tc.progress_iter(cands, desc="exhaustive subsets")]
     scored.sort(key=lambda d: d["fidelity"], reverse=True)
     return scored
 
@@ -224,7 +228,8 @@ def local_search_refine(model, blocks, seed_keep, depth, *, forced=(), block_len
     history = [{"keep": cur, "fidelity": cur_f, "round": 0}]
     for rnd in range(1, max_rounds + 1):
         best, best_f = cur, cur_f
-        for cand in one_swaps(cur, depth, forced):
+        swaps = one_swaps(cur, depth, forced)
+        for cand in tc.progress_iter(swaps, desc=f"refine round {rnd}"):
             f = subset_fidelity(model, blocks, cand, block_length=block_length, device=device, state=state)
             if f > best_f:
                 best, best_f = cand, f
@@ -233,6 +238,40 @@ def local_search_refine(model, blocks, seed_keep, depth, *, forced=(), block_len
         cur, cur_f = best, best_f
         history.append({"keep": cur, "fidelity": cur_f, "round": rnd})
     return history
+
+
+def random_seed_subsets(depth: int, n_total: int, k: int, *, forced=(), seed: int = 0):
+    """k random keep-sets of size n_total (forced layers always included) — the
+    restart points for random-restart hill-climbing."""
+    rng = np.random.default_rng(seed)
+    forced = set(forced)
+    pool = [l for l in range(depth) if l not in forced]
+    need = n_total - len(forced)
+    out = []
+    for _ in range(k):
+        pick = rng.choice(pool, size=need, replace=False).tolist()
+        out.append(tuple(sorted(forced | set(pick))))
+    return out
+
+
+def multi_restart_refine(model, blocks, seeds, depth, *, forced=(), block_length,
+                         device, state, max_rounds: int = 12):
+    """Hill-climb from each seed; return (best_history, all_optima). `all_optima`
+    is the list of (keep, fidelity) basin tops — its spread is a multimodality
+    diagnostic (many different optima at similar fidelity ⇒ the subset identity is
+    weakly determined)."""
+    best_hist, optima, seen = None, [], {}
+    for sd in seeds:
+        hist = local_search_refine(model, blocks, sd, depth, forced=forced,
+                                   block_length=block_length, device=device, state=state,
+                                   max_rounds=max_rounds)
+        top = hist[-1]
+        optima.append((top["keep"], top["fidelity"]))
+        for h in hist:
+            seen[h["keep"]] = max(seen.get(h["keep"], 0.0), h["fidelity"])
+        if best_hist is None or top["fidelity"] > best_hist[-1]["fidelity"]:
+            best_hist = hist
+    return best_hist, optima, seen
 
 
 def layer_importance(scored, depth, top_frac=0.1):
@@ -318,6 +357,11 @@ def _selftest() -> None:
     assert len(sw) == 2 * (20 - 4), len(sw)
     # no forced: all 4 are swappable
     assert len(one_swaps((1, 4, 9, 15), 20)) == 4 * (20 - 4)
+    # random restart seeds: right size, forced included, deterministic
+    seeds = random_seed_subsets(20, 4, 5, forced=(0, 19), seed=0)
+    assert len(seeds) == 5 and all(len(s) == 4 and 0 in s and 19 in s for s in seeds)
+    assert random_seed_subsets(20, 4, 5, forced=(0, 19), seed=0) == seeds  # reproducible
+    assert all(len(s) == 4 for s in random_seed_subsets(20, 4, 3))         # free (no forced)
     print("eval_layer_subset selftest OK")
 
 
@@ -333,6 +377,9 @@ def main() -> None:
     ap.add_argument("--refine", action="store_true",
                     help="hill-climb (1-swap local search) from the best subset — the cheap "
                          "stand-in for Draft&Verify's Bayesian optimization; ~150-250 evals")
+    ap.add_argument("--restarts", type=int, default=0,
+                    help="random-restart hill-climbing: this many random seeds (+ the search "
+                         "seed) refined independently; cures the flat/multi-modal instability")
     ap.add_argument("--n_samples", type=int, default=20)
     ap.add_argument("--block_length", type=int, default=32)
     ap.add_argument("--device", default="cuda")
@@ -365,19 +412,26 @@ def main() -> None:
         else:
             scored = exhaustive_search(model, blocks, depth, args.extra, keep_first_last=keep_fl,
                                        block_length=args.block_length, device=args.device, state=state)
-        if args.refine:
+        if args.refine or args.restarts:
             forced = forced_layers(depth, keep_fl)
-            seed = scored[0]["keep"]
-            print(f"[layer-subset] refining (1-swap hill-climb) from seed {seed} "
-                  f"f={scored[0]['fidelity']:.1%}")
-            ref_hist = local_search_refine(model, blocks, seed, depth, forced=forced,
-                                           block_length=args.block_length, device=args.device, state=state)
-            for h in ref_hist[1:]:
-                print(f"    round {h['round']}: keep={h['keep']}  fidelity={h['fidelity']:.1%}")
-            # merge refined path into scored and re-rank (dedup by keep-set)
+            n_total = args.extra + (2 if keep_fl else 0)
+            seeds = [scored[0]["keep"]]
+            if args.restarts:
+                seeds += random_seed_subsets(depth, n_total, args.restarts, forced=forced, seed=0)
+            print(f"[layer-subset] {'random-restart ' if args.restarts else ''}hill-climb "
+                  f"from {len(seeds)} seed(s)")
+            best_hist, optima, seen = multi_restart_refine(
+                model, blocks, seeds, depth, forced=forced,
+                block_length=args.block_length, device=args.device, state=state)
+            for h in best_hist[1:]:
+                print(f"    best-path round {h['round']}: keep={h['keep']}  fidelity={h['fidelity']:.1%}")
+            # multimodality diagnostic: distinct basin optima and their spread
+            uniq = sorted({k: f for k, f in optima}.items(), key=lambda kv: kv[1], reverse=True)
+            print(f"    {len(uniq)} distinct local optima; "
+                  f"fidelity range {uniq[-1][1]:.1%}–{uniq[0][1]:.1%}")
             merged = {d["keep"]: d["fidelity"] for d in scored}
-            for h in ref_hist:
-                merged[h["keep"]] = max(merged.get(h["keep"], 0.0), h["fidelity"])
+            for k, f in seen.items():
+                merged[k] = max(merged.get(k, 0.0), f)
             scored = sorted(({"keep": k, "fidelity": f} for k, f in merged.items()),
                             key=lambda d: d["fidelity"], reverse=True)
         # references at EQUAL budget (same #layers as the flexible subset)
