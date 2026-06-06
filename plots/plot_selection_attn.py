@@ -181,10 +181,17 @@ def _gather_cand_emb(W, cand):
 
 
 def train_attn(data: dict, head: tc.RankHead, *, tail_only: bool = True,
+               zero_neighbors: bool = False,
                d_attn: int = 256, n_heads: int = 4, n_layers: int = 2,
                epochs: int = 40, lr: float = 1e-3, batch_blocks: int = 16,
                device: str = "cuda", seed: int = 0) -> dict:
-    """Fit on train prompts, evaluate selection accuracy on held-out prompts."""
+    """Fit on train prompts, evaluate selection accuracy on held-out prompts.
+
+    zero_neighbors: ablation — feed zeroed neighbor hiddens so the value branch
+    carries no token content (only the null key + the anchor branch remain). If the
+    full-neighbor run equals this ablation, the neighbor pathway adds nothing —
+    the decisive check for "neighbors don't help" vs "attention not training".
+    """
     import torch
     torch.manual_seed(seed)
     D, K = data["D"], data["K"]
@@ -192,6 +199,7 @@ def train_attn(data: dict, head: tc.RankHead, *, tail_only: bool = True,
     W = torch.tensor(head.W, dtype=torch.float32, device=device)   # [V,D]
     model = _build_model(D, d_attn, n_heads, n_layers).to(device)
     opt = torch.optim.Adam(model.parameters(), lr=lr)
+    zc_scale = 0.0 if zero_neighbors else 1.0
 
     def _batched(idx):
         for s in range(0, len(idx), batch_blocks):
@@ -206,7 +214,7 @@ def train_attn(data: dict, head: tc.RankHead, *, tail_only: bool = True,
         model.train()
         order = tr_idx[rng.permutation(len(tr_idx))]
         for bi in _batched(order):
-            z = _to(data["z"][bi]); zc = _to(data["zc"][bi])
+            z = _to(data["z"][bi]); zc = _to(data["zc"][bi]) * zc_scale
             valid = torch.tensor(data["valid"][bi], device=device)
             cand = torch.tensor(data["cand"][bi], dtype=torch.long, device=device)
             tgt = torch.tensor(data["target"][bi], dtype=torch.long, device=device)
@@ -229,7 +237,7 @@ def train_attn(data: dict, head: tc.RankHead, *, tail_only: bool = True,
     te_idx = np.where(te_pid)[0]
     with torch.no_grad():
         for bi in _batched(te_idx):
-            z = _to(data["z"][bi]); zc = _to(data["zc"][bi])
+            z = _to(data["z"][bi]); zc = _to(data["zc"][bi]) * zc_scale
             valid = torch.tensor(data["valid"][bi], device=device)
             cand = torch.tensor(data["cand"][bi], dtype=torch.long, device=device)
             u = model(z, zc, valid)
@@ -350,6 +358,9 @@ def main() -> None:
     ap.add_argument("--batch_blocks", type=int, default=16)
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--no_tail_only", action="store_true")
+    ap.add_argument("--no_neighbors", action="store_true",
+                    help="ablation: zero neighbor content (only null+anchor) — if equal to "
+                         "the full run, the neighbor pathway adds nothing.")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--selftest", action="store_true")
     args = ap.parse_args()
@@ -365,6 +376,7 @@ def main() -> None:
         data = compute_block_inputs(args.probes_root, args.model, head, k,
                                     block_length=args.block_length, n_samples=args.n_samples)
         per_k[k] = train_attn(data, head, tail_only=not args.no_tail_only,
+                              zero_neighbors=args.no_neighbors,
                               d_attn=args.d_attn, n_heads=args.n_heads, n_layers=args.n_layers,
                               epochs=args.epochs, lr=args.lr, batch_blocks=args.batch_blocks,
                               device=args.device, seed=args.seed)
