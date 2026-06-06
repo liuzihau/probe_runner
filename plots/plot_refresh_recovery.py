@@ -182,9 +182,11 @@ def run_partial_depth(model_path: str, samples: list, *, block_length: int = 32,
     emb = base.word_embeddings if hasattr(base, "word_embeddings") else model.get_input_embeddings()
     dtype = next(model.parameters()).dtype
 
-    # hook state: cache[layer_idx] = iter-0 hidden to inject; cut_layer = L
+    # hook state: cache[layer_idx] = iter-0 hidden to inject; cut_layer = L;
+    # reveal = bool mask [seq] of positions whose iter-1 input changed (the new
+    # commits) — these must keep their FRESH compute so the reveal propagates.
     cache: dict[int, "torch.Tensor"] = {}
-    state = {"cut": None, "record": False}
+    state = {"cut": None, "record": False, "reveal": None}
     handles = []
 
     def mk_hook(idx):
@@ -193,9 +195,14 @@ def run_partial_depth(model_path: str, samples: list, *, block_length: int = 32,
             if state["record"]:
                 cache[idx] = h.detach()
             elif state["cut"] is not None and idx < state["cut"]:
-                # inject the cached iter-0 hidden for this early layer
-                h = cache[idx]
-                return (h,) + out[1:] if isinstance(out, tuple) else h
+                # reuse iter-0 hidden for unchanged positions, but PRESERVE the
+                # freshly-computed hidden at revealed positions so their new tokens
+                # propagate up the stack (else the cut layer changes nothing).
+                h_new = cache[idx].clone()
+                rev = state["reveal"]
+                if rev is not None:
+                    h_new[:, rev] = h[:, rev]
+                return (h_new,) + out[1:] if isinstance(out, tuple) else h_new
             return None
         return hook
 
@@ -240,18 +247,30 @@ def run_partial_depth(model_path: str, samples: list, *, block_length: int = 32,
                 x0, hc, _ = _commit_uniform(logits0, iter0[:, s:e], tc.MASK_ID, 0.3)
                 iter1 = iter0.clone()
                 iter1[0, s:e][hc[0]] = x0[0][hc[0]]
+                # measure recovery on the STILL-MASKED tail only: the committed
+                # (revealed) positions keep fresh compute and trivially match at
+                # every L, which would flatten/inflate the curve. The tail is the
+                # population a refresh is FOR.
+                valid = torch.tensor(tc.valid_position_mask(b, e - s, sample["attrs"],
+                                                            block_length), device=device)
+                tail = valid & ~hc[0]
+                if tail.float().sum() == 0:
+                    continue
+                # revealed positions (absolute) = the freshly-committed block tokens
+                reveal = torch.zeros(e, dtype=torch.bool, device=device)
+                reveal[s + torch.where(hc[0])[0]] = True
+                state["reveal"] = reveal
                 # true iter-1 prediction (full recompute)
                 state["cut"] = None
                 true_pred = _think_pred(iter1, e, s, e)
-                # partial-depth at each cut L
-                valid = torch.tensor(tc.valid_position_mask(b, e - s, sample["attrs"],
-                                                            block_length), device=device)
+                # partial-depth at each cut L: reuse iter-0 for masked tail < L,
+                # recompute L..top; reveals propagate via the preserved-fresh hook.
                 for L in range(depth + 1):
                     state["cut"] = L
                     pred = _think_pred(iter1, e, s, e)
-                    match = ((pred == true_pred) & valid).float().sum() / valid.float().sum().clamp_min(1)
+                    match = ((pred == true_pred) & tail).float().sum() / tail.float().sum()
                     fid_sum[L] += float(match)
-                state["cut"] = None
+                state["cut"], state["reveal"] = None, None
             fid_cnt += 1
     for h in handles:
         h.remove()
