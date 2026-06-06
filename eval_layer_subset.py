@@ -55,12 +55,16 @@ def enumerate_candidates(depth: int, extra: int, *, keep_first_last: bool = True
     return [tuple(sorted(forced | set(c))) for c in itertools.combinations(middle, extra)]
 
 
-def contiguous_top(depth: int, n_keep: int, *, keep_first_last: bool = True) -> tuple[int, ...]:
-    """The C15-style baseline: keep the top n_keep layers (+ forced) — a
-    contiguous cut, to compare against the flexible subset at equal budget."""
-    keep = set(range(depth - n_keep, depth))
+def contiguous_top(depth: int, n_total: int, *, keep_first_last: bool = True) -> tuple[int, ...]:
+    """The C15-style baseline at EQUAL budget: keep exactly `n_total` layers
+    contiguously from the top. If keep_first_last, force layer 0 and fill the
+    remaining n_total-1 from the top (the last layer is naturally in that block),
+    so the count matches a flexible subset of the same size — not one fewer."""
+    n_total = max(1, min(n_total, depth))
     if keep_first_last:
-        keep |= {0, depth - 1}
+        keep = {0} | set(range(depth - (n_total - 1), depth))
+    else:
+        keep = set(range(depth - n_total, depth))
     return tuple(sorted(keep))
 
 
@@ -197,6 +201,40 @@ def exhaustive_search(model, blocks, depth, extra, *, keep_first_last, block_len
     return scored
 
 
+def one_swaps(keep, depth: int, forced=()):
+    """Neighbor subsets: replace one (non-forced) kept layer with one dropped
+    layer. The fixed-budget analogue of a 1-bit flip — the local-search move."""
+    kept = set(keep)
+    forced = set(forced)
+    out = []
+    for r in kept - forced:                     # never swap out a forced layer
+        for a in range(depth):
+            if a not in kept:
+                out.append(tuple(sorted((kept - {r}) | {a})))
+    return out
+
+
+def local_search_refine(model, blocks, seed_keep, depth, *, forced=(), block_length,
+                        device, state, max_rounds: int = 12):
+    """Hill-climb from `seed_keep`: at each round adopt the single best 1-swap that
+    improves fidelity; stop at a local optimum (the cheap stand-in for D&V's
+    Bayesian optimization over the fixed-budget subset space)."""
+    cur = tuple(sorted(seed_keep))
+    cur_f = subset_fidelity(model, blocks, cur, block_length=block_length, device=device, state=state)
+    history = [{"keep": cur, "fidelity": cur_f, "round": 0}]
+    for rnd in range(1, max_rounds + 1):
+        best, best_f = cur, cur_f
+        for cand in one_swaps(cur, depth, forced):
+            f = subset_fidelity(model, blocks, cand, block_length=block_length, device=device, state=state)
+            if f > best_f:
+                best, best_f = cand, f
+        if best == cur:
+            break                               # local optimum
+        cur, cur_f = best, best_f
+        history.append({"keep": cur, "fidelity": cur_f, "round": rnd})
+    return history
+
+
 def layer_importance(scored, depth, top_frac=0.1):
     """How often each layer appears among the top fraction of subsets."""
     n = max(1, int(len(scored) * top_frac))
@@ -209,9 +247,9 @@ def layer_importance(scored, depth, top_frac=0.1):
 
 # ---- report + plot ----------------------------------------------------------
 
-def format_report(scored, refs, depth, extra) -> str:
-    lines = [f"Layer-subset search (depth={depth}, keep forced+{extra}; "
-             f"draft compute = {(2 + extra)}/{depth} = {(2+extra)/depth:.0%})"]
+def format_report(scored, refs, depth, n_total) -> str:
+    lines = [f"Layer-subset search (depth={depth}, keep {n_total} layers; "
+             f"draft compute = {n_total}/{depth} = {n_total/depth:.0%})"]
     lines.append("  references:")
     for name, k, f in refs:
         lines.append(f"    {name:<16s} keep={k}  fidelity={f:.1%}")
@@ -262,13 +300,24 @@ def _selftest() -> None:
         assert list(k) == sorted(k)
     # no forced
     assert len(enumerate_candidates(depth, 2, keep_first_last=False)) == math.comb(depth, 2)
-    assert contiguous_top(20, 2) == (0, 18, 19)
+    # equal-budget contiguous: n_total layers exactly, first forced + top block
+    assert contiguous_top(20, 4) == (0, 17, 18, 19), contiguous_top(20, 4)
+    assert len(contiguous_top(20, 4)) == 4 and len(enumerate_candidates(20, 2)[0]) == 4
+    assert contiguous_top(20, 4, keep_first_last=False) == (16, 17, 18, 19)
     assert abs(compute_fraction((0, 7, 13, 19), 20) - 0.2) < 1e-9
     # layer_importance picks the always-present layers
     scored = [{"keep": (0, 5, 19), "fidelity": 0.9}, {"keep": (0, 6, 19), "fidelity": 0.8},
               {"keep": (0, 7, 19), "fidelity": 0.1}]
     imp = layer_importance(scored, 20, top_frac=0.67)        # top 2 of 3
     assert imp[0] == 1.0 and imp[19] == 1.0 and imp[5] == 0.5 and imp[7] == 0.0
+    # 1-swap neighbors: fixed size, each is a valid swap, forced layers never dropped
+    sw = one_swaps((0, 4, 18, 19), 20, forced=(0, 19))
+    assert all(len(s) == 4 and 0 in s and 19 in s for s in sw)
+    assert (0, 5, 18, 19) in sw and (0, 4, 18, 19) not in sw   # neighbors, not self
+    # swappable layers = {4,18}, targets = 20-4=16 each → 32 neighbors
+    assert len(sw) == 2 * (20 - 4), len(sw)
+    # no forced: all 4 are swappable
+    assert len(one_swaps((1, 4, 9, 15), 20)) == 4 * (20 - 4)
     print("eval_layer_subset selftest OK")
 
 
@@ -281,6 +330,9 @@ def main() -> None:
     ap.add_argument("--extra", type=int, default=2, help="middle layers to choose (+ forced first/last)")
     ap.add_argument("--no_force_first_last", action="store_true")
     ap.add_argument("--greedy", action="store_true", help="forward-greedy instead of exhaustive")
+    ap.add_argument("--refine", action="store_true",
+                    help="hill-climb (1-swap local search) from the best subset — the cheap "
+                         "stand-in for Draft&Verify's Bayesian optimization; ~150-250 evals")
     ap.add_argument("--n_samples", type=int, default=20)
     ap.add_argument("--block_length", type=int, default=32)
     ap.add_argument("--device", default="cuda")
@@ -313,17 +365,33 @@ def main() -> None:
         else:
             scored = exhaustive_search(model, blocks, depth, args.extra, keep_first_last=keep_fl,
                                        block_length=args.block_length, device=args.device, state=state)
-        # references at equal budget
+        if args.refine:
+            forced = forced_layers(depth, keep_fl)
+            seed = scored[0]["keep"]
+            print(f"[layer-subset] refining (1-swap hill-climb) from seed {seed} "
+                  f"f={scored[0]['fidelity']:.1%}")
+            ref_hist = local_search_refine(model, blocks, seed, depth, forced=forced,
+                                           block_length=args.block_length, device=args.device, state=state)
+            for h in ref_hist[1:]:
+                print(f"    round {h['round']}: keep={h['keep']}  fidelity={h['fidelity']:.1%}")
+            # merge refined path into scored and re-rank (dedup by keep-set)
+            merged = {d["keep"]: d["fidelity"] for d in scored}
+            for h in ref_hist:
+                merged[h["keep"]] = max(merged.get(h["keep"], 0.0), h["fidelity"])
+            scored = sorted(({"keep": k, "fidelity": f} for k, f in merged.items()),
+                            key=lambda d: d["fidelity"], reverse=True)
+        # references at EQUAL budget (same #layers as the flexible subset)
         n_keep_total = args.extra + (2 if keep_fl else 0)
+        ctop = contiguous_top(depth, n_keep_total, keep_first_last=keep_fl)
         refs = [
             ("full(all layers)", tuple(range(depth)),
              subset_fidelity(model, blocks, tuple(range(depth)), block_length=args.block_length,
                              device=args.device, state=state)),
-            ("contiguous-top", contiguous_top(depth, args.extra, keep_first_last=keep_fl),
-             subset_fidelity(model, blocks, contiguous_top(depth, args.extra, keep_first_last=keep_fl),
-                             block_length=args.block_length, device=args.device, state=state)),
+            (f"contiguous-top({len(ctop)}L)", ctop,
+             subset_fidelity(model, blocks, ctop, block_length=args.block_length,
+                             device=args.device, state=state)),
         ]
-        print(format_report(scored, refs, depth, args.extra))
+        print(format_report(scored, refs, depth, n_keep_total))
         plot(scored, refs, depth, Path(args.probes_root) / args.model / "plots", args.model)
     finally:
         for h in handles:
