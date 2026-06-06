@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import argparse
 import itertools
+import math
 from pathlib import Path
 
 import numpy as np
@@ -403,15 +404,21 @@ def main() -> None:
         samples = [tc.load_sample(p) for p in tc.iter_sample_paths(args.probes_root, args.model)]
         blocks = precompute_blocks(model, tokenizer, samples, block_length=args.block_length,
                                    n_samples=args.n_samples, device=args.device, state=state)
-        print(f"[layer-subset] {len(blocks)} blocks; depth={depth}; "
-              f"{'greedy' if args.greedy else 'exhaustive'} over choose-{args.extra}")
-        if args.greedy:
+        # Pick the search mode. IMPORTANT: --restarts (and --greedy) use a CHEAP seed
+        # search — only the bare default (no --greedy, no --restarts) runs the full
+        # exhaustive sweep. This avoids the footgun where --restarts silently triggered
+        # the ~4845-subset exhaustive just to seed the restarts.
+        mode = "restart" if args.restarts else ("greedy" if args.greedy else "exhaustive")
+        n_cand = math.comb(depth - (2 if keep_fl else 0), args.extra)
+        print(f"[layer-subset] {len(blocks)} blocks; depth={depth}; mode={mode}; "
+              f"choose-{args.extra}" + (f" (exhaustive = {n_cand} subsets)" if mode == "exhaustive" else ""))
+        if mode == "exhaustive":
+            scored = exhaustive_search(model, blocks, depth, args.extra, keep_first_last=keep_fl,
+                                       block_length=args.block_length, device=args.device, state=state)
+        else:                                   # greedy OR restart both seed from cheap greedy
             hist = greedy_search(model, blocks, depth, args.extra, keep_first_last=keep_fl,
                                  block_length=args.block_length, device=args.device, state=state)
             scored = [{"keep": h["keep"], "fidelity": h["fidelity"]} for h in hist][::-1]
-        else:
-            scored = exhaustive_search(model, blocks, depth, args.extra, keep_first_last=keep_fl,
-                                       block_length=args.block_length, device=args.device, state=state)
         if args.refine or args.restarts:
             forced = forced_layers(depth, keep_fl)
             n_total = args.extra + (2 if keep_fl else 0)
