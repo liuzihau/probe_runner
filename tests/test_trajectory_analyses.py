@@ -25,6 +25,8 @@ from probe_runner.plots import plot_rank_trajectory as rank
 from probe_runner.plots import plot_trajectory_domains as dom
 from probe_runner.plots import plot_refresh_recovery as refresh
 from probe_runner.plots import plot_repairability as repair
+from probe_runner.plots import plot_miss_types as miss
+from probe_runner.plots import plot_selection_head as select
 
 BL = 8  # synthetic block_length
 
@@ -78,6 +80,45 @@ def _check_repair():
     print("  [repairability] numpy cores  OK")
 
 
+def _check_miss_types(root):
+    # numpy/py cores
+    miss._selftest()
+    # end-to-end on synthetic captures (Step 0 is fully offline: head + a fake
+    # decode_fn typing even ids as digits, odd as words).
+    head = tc.RankHead.load(tc.find_head_export(root, "llada2"))
+    decode_fn = lambda tid: "42" if tid % 2 == 0 else "the"
+    data = miss.compute_miss_types(root, "llada2", head, decode_fn, block_length=BL)
+    assert data["rank0"].size == data["codes"].size > 0, "miss-types produced no positions"
+    assert set(np.unique(data["codes"]).tolist()) <= set(range(len(miss.TOKEN_TYPES)))
+    stats = miss.miss_type_stats(data["rank0"], data["codes"], ceilings=(10, 100))
+    assert 0.0 <= stats["load_bearing_share"] <= 1.0
+    table = miss.bucket_type_table(data["rank0"], data["codes"])
+    assert table.sum() == data["rank0"].size
+    miss.plot(stats, table, Path(root) / "llada2" / "plots", "llada2")
+    print(f"  [miss-types] N={stats['n']} load-bearing-share={stats['load_bearing_share']:.0%} "
+          f"miss@10={stats['per_k'][10]['miss_rate']:.0%}  OK")
+
+
+def _check_selection_head(root):
+    # numpy cores
+    select._selftest()
+    # end-to-end on synthetic captures (Step 1 is fully offline: head only).
+    head = tc.RankHead.load(tc.find_head_export(root, "llada2"))
+    data = select.compute_selection_inputs(root, "llada2", head, K=8, block_length=BL)
+    assert data["z"].shape[0] == data["target_idx"].size > 0, "no selection inputs"
+    assert data["cand_emb"].shape[1] == 8 and data["cand_emb"].shape[2] == head.d_model
+    # converged token's slot, where present, must really index its id in the top-K
+    res = select.evaluate(data, epochs=120)
+    o = res["overall"]
+    assert 0.0 <= o["argmax_copy"] <= o["ceiling"] <= 1.0, (o["argmax_copy"], o["ceiling"])
+    assert not (set(data["prompt_id"][select._prompt_split(data["prompt_id"])[0]]) &
+                set(data["prompt_id"][select._prompt_split(data["prompt_id"])[1]]))
+    select.plot({8: res}, Path(root) / "llada2" / "plots", "llada2")
+    print(f"  [selection-head] train/test={res['n_train']}/{res['n_test']} "
+          f"argmax-copy={o['argmax_copy']:.0%}→selection={o['selection']:.0%} "
+          f"(ceiling {o['ceiling']:.0%})  OK")
+
+
 def main():
     with tempfile.TemporaryDirectory() as td:
         build(td, n_samples=4)
@@ -86,8 +127,10 @@ def main():
         _check_domains(td)
         _check_refresh(td)
         _check_repair()
+        _check_miss_types(td)
+        _check_selection_head(td)
         plots = sorted((Path(td) / "llada2" / "plots").glob("*.png"))
-        assert len(plots) >= 4, f"expected >=4 plots, got {len(plots)}"
+        assert len(plots) >= 6, f"expected >=6 plots, got {len(plots)}"
         print(f"\nALL TRAJECTORY ANALYSIS TESTS PASS ({len(plots)} plots generated)")
 
 
