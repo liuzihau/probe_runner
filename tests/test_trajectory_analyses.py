@@ -106,17 +106,23 @@ def _check_selection_head(root):
     head = tc.RankHead.load(tc.find_head_export(root, "llada2"))
     data = select.compute_selection_inputs(root, "llada2", head, K=8, block_length=BL)
     assert data["z"].shape[0] == data["target_idx"].size > 0, "no selection inputs"
+    assert data["neigh"].shape == data["z"].shape, "neighbor feature shape mismatch"
     assert data["cand_emb"].shape[1] == 8 and data["cand_emb"].shape[2] == head.d_model
-    # converged token's slot, where present, must really index its id in the top-K
-    res = select.evaluate(data, epochs=120)
-    o = res["overall"]
-    assert 0.0 <= o["argmax_copy"] <= o["ceiling"] <= 1.0, (o["argmax_copy"], o["ceiling"])
+    # all three variants (static-all / tail-only / tail+neigh) must run end-to-end
+    variants = select.run_variants(data, epochs=120)
+    assert set(variants) == {lbl for lbl, _, _ in select.VARIANTS}
+    # the neighbor-conditioned head uses a [2D,D] affine
+    feat = select._feature(data, use_neighbors=True)
+    assert feat.shape[1] == 2 * head.d_model
+    for lbl, res in variants.items():
+        t = res["tail"]
+        assert 0.0 <= t["argmax_copy"] <= t["ceiling"] <= 1.0, (lbl, t)
     assert not (set(data["prompt_id"][select._prompt_split(data["prompt_id"])[0]]) &
                 set(data["prompt_id"][select._prompt_split(data["prompt_id"])[1]]))
-    select.plot({8: res}, Path(root) / "llada2" / "plots", "llada2")
-    print(f"  [selection-head] train/test={res['n_train']}/{res['n_test']} "
-          f"argmax-copy={o['argmax_copy']:.0%}→selection={o['selection']:.0%} "
-          f"(ceiling {o['ceiling']:.0%})  OK")
+    select.plot({8: variants}, Path(root) / "llada2" / "plots", "llada2")
+    to = variants["tail-only"]
+    print(f"  [selection-head] test={to['n_test']} variants={list(variants)} "
+          f"tail-only selection={to['tail']['selection']:.0%} (ceiling {to['tail']['ceiling']:.0%})  OK")
 
 
 def main():

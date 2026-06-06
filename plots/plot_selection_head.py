@@ -65,10 +65,20 @@ def head_scores(z: np.ndarray, cand_emb: np.ndarray,
                 A: np.ndarray, b: np.ndarray) -> np.ndarray:
     """Candidate scores s[n,k] = (z_n @ A + b) · cand_emb[n,k].
 
-    z [N,D] anchor features (rmsnorm'd hidden); cand_emb [N,K,D] unembedding rows
-    of each position's K candidates; A [D,D], b [D]. Linear in (A,b)."""
+    z [N,Dz] position features (rmsnorm'd anchor hidden, optionally concatenated
+    with a revealed-neighbor feature); cand_emb [N,K,D] unembedding rows of each
+    position's K candidates; A [Dz,D], b [D]. Linear in (A,b)."""
     u = z @ A + b                                          # [N, D]
     return np.einsum("nd,nkd->nk", u, cand_emb)            # [N, K]
+
+
+def _init_affine(Dz: int, D: int) -> np.ndarray:
+    """A [Dz,D] with the leading DxD (anchor) block = identity, rest zero, so the
+    head starts at the logit lens over the anchor and a no-op on extra features."""
+    A = np.zeros((Dz, D))
+    m = min(Dz, D)
+    A[:m, :m] = np.eye(m)
+    return A
 
 
 def fit_selection_head(z: np.ndarray, cand_emb: np.ndarray, target_idx: np.ndarray,
@@ -78,16 +88,19 @@ def fit_selection_head(z: np.ndarray, cand_emb: np.ndarray, target_idx: np.ndarr
     candidates. Positions with target_idx < 0 (converged token not in top-K) are
     dropped from the loss. Adam, minibatched (cand_emb can be large at K=100).
 
-    Initialised at A=I, b=0 (the logit lens) so training only *re-ranks*.
+    Feature dim Dz may exceed the candidate-embedding dim D (neighbor-conditioned
+    head). Initialised at the logit lens on the anchor block (_init_affine) so
+    training only *re-ranks*.
     """
     z = np.asarray(z, np.float64)
     cand_emb = np.asarray(cand_emb, np.float64)
     target_idx = np.asarray(target_idx)
     keep = target_idx >= 0
     z, cand_emb, t = z[keep], cand_emb[keep], target_idx[keep]
-    N, D = z.shape
+    N, Dz = z.shape
+    D = cand_emb.shape[2]
     K = cand_emb.shape[1]
-    A = np.eye(D)
+    A = _init_affine(Dz, D)
     b = np.zeros(D)
     mA = np.zeros_like(A); vA = np.zeros_like(A)
     mb = np.zeros_like(b); vb = np.zeros_like(b)
@@ -154,13 +167,19 @@ def _topk_ids(logits_row: np.ndarray, k: int) -> np.ndarray:
 
 def compute_selection_inputs(probes_root, model: str, head: tc.RankHead, K: int,
                              block_length: int = 32, n_samples: int | None = None) -> dict:
-    """Per valid position gather (z, cand_emb, target_idx, rank0, prompt_id).
+    """Per valid position gather (z, neigh, cand_emb, target_idx, rank0, prompt_id).
 
-    z = rmsnorm(iter-0 hidden); cand_emb = W_head rows of think's iter-0 top-K;
-    target_idx = slot of the converged token in that top-K (-1 if absent);
-    prompt_id = sample-file stem (for the prompt-disjoint split).
+    z      = rmsnorm(iter-0 hidden) — the static anchor feature (Step 1 / R3);
+    neigh  = leave-one-out mean of the block's *converged* (revealed) neighbor
+             hiddens, rmsnorm'd — the revealed-neighbor context (R4). Excludes the
+             position's own hidden, so it cannot leak the target. This is the
+             fully-revealed upper bound on neighbor signal: at decode the talk sees
+             only the *already-committed* neighbors, so neigh over-states what is
+             available mid-block.
+    cand_emb = W_head rows of think's iter-0 top-K; target_idx = slot of the
+    converged token in that top-K (-1 if absent); prompt_id = sample stem (split).
     """
-    z_all, e_all, t_all, r_all, pid_all = [], [], [], [], []
+    z_all, g_all, e_all, t_all, r_all, pid_all = [], [], [], [], [], []
     W = head.W                                             # [vocab, D]
     done = 0
     for path in tc.iter_sample_paths(probes_root, model):
@@ -170,7 +189,9 @@ def compute_selection_inputs(probes_root, model: str, head: tc.RankHead, K: int,
         for b, blk in sorted(sample["blocks"].items()):
             if "converged_tokens" not in blk and "committed_tokens_per_pass" not in blk:
                 continue
-            h0 = np.asarray(blk["h_per_pass"][0, -1])      # [B, D] iter-0 last layer
+            hpp = np.asarray(blk["h_per_pass"])            # [P, L+1, B, D]
+            h0 = hpp[0, -1]                                # [B, D] iter-0 last layer
+            h_conv = hpp[-1, -1]                           # [B, D] converged last layer
             conv = np.asarray(tc.converged_tokens(blk))    # [B]
             valid = tc.valid_position_mask(b, h0.shape[0], attrs, block_length)
             valid &= (conv != tc.MASK_ID)
@@ -179,6 +200,10 @@ def compute_selection_inputs(probes_root, model: str, head: tc.RankHead, K: int,
             h0v, convv = h0[valid], conv[valid]
             logits = head.logits(h0v)                      # [Bv, vocab]
             z = head._rmsnorm(h0v)                         # [Bv, D]
+            # revealed-neighbor feature: LOO-mean of converged neighbor vectors.
+            zc = head._rmsnorm(h_conv[valid])              # [Bv, D]
+            Bv = zc.shape[0]
+            neigh = ((zc.sum(0, keepdims=True) - zc) / (Bv - 1)) if Bv > 1 else np.zeros_like(zc)
             r0 = (logits > logits[np.arange(len(convv)), convv][:, None]).sum(-1) + 1
             for i in range(len(convv)):
                 ids = _topk_ids(logits[i], K)              # [K]
@@ -186,14 +211,17 @@ def compute_selection_inputs(probes_root, model: str, head: tc.RankHead, K: int,
                 t_all.append(int(hit[0]) if hit.size else -1)
                 e_all.append(W[ids])                       # [K, D]
                 z_all.append(z[i])
+                g_all.append(neigh[i])
                 r_all.append(int(r0[i]))
                 pid_all.append(pid)
         done += 1
         if n_samples and done >= n_samples:
             break
+    D = head.d_model
     return {
-        "z": np.asarray(z_all, np.float64) if z_all else np.zeros((0, head.d_model)),
-        "cand_emb": np.asarray(e_all, np.float64) if e_all else np.zeros((0, K, head.d_model)),
+        "z": np.asarray(z_all, np.float64) if z_all else np.zeros((0, D)),
+        "neigh": np.asarray(g_all, np.float64) if g_all else np.zeros((0, D)),
+        "cand_emb": np.asarray(e_all, np.float64) if e_all else np.zeros((0, K, D)),
         "target_idx": np.asarray(t_all, np.int64),
         "rank0": np.asarray(r_all, np.int64),
         "prompt_id": np.asarray(pid_all),
@@ -209,17 +237,36 @@ def _prompt_split(prompt_id: np.ndarray, frac_train: float = 0.5) -> tuple[np.nd
     return tr, ~tr
 
 
-def evaluate(data: dict, *, epochs: int = 300, seed: int = 0) -> dict:
-    """Fit on train prompts, report acc on test prompts, overall + per bucket."""
+def _feature(data: dict, use_neighbors: bool) -> np.ndarray:
+    """Position feature: anchor only, or [anchor ; revealed-neighbor]."""
+    if not use_neighbors:
+        return data["z"]
+    return np.concatenate([data["z"], data["neigh"]], axis=1)
+
+
+def evaluate(data: dict, *, tail_only: bool = False, use_neighbors: bool = False,
+             epochs: int = 300, seed: int = 0) -> dict:
+    """Fit on train prompts (optionally tail-only / neighbor-conditioned), report
+    acc on the held-out test prompts, overall + per bucket + tail aggregate.
+
+    tail_only (R1): exclude easy (r0=1) positions from *training* — the committed
+    half is carried through at think's argmax, so the readout should not spend a
+    single global affine preserving it. use_neighbors (R4): concatenate the
+    revealed-neighbor feature.
+    """
+    feat = _feature(data, use_neighbors)
     tr, te = _prompt_split(data["prompt_id"])
-    A, b = fit_selection_head(data["z"][tr], data["cand_emb"][tr], data["target_idx"][tr],
+    train = tr.copy()
+    if tail_only:
+        train &= (data["rank0"] > 1)
+    A, b = fit_selection_head(feat[train], data["cand_emb"][train], data["target_idx"][train],
                               epochs=epochs, seed=seed)
-    scores = head_scores(data["z"][te], data["cand_emb"][te], A, b)
+    scores = head_scores(feat[te], data["cand_emb"][te], A, b)
     t_te = data["target_idx"][te]
     bucket = readiness_bucket(data["rank0"][te])
-    base = baseline_summary(t_te)
-    res = {"overall": {**base, "selection": selection_accuracy(scores, t_te)},
-           "by_bucket": {}, "n_train": int(tr.sum()), "n_test": int(te.sum())}
+    res = {"overall": {**baseline_summary(t_te), "selection": selection_accuracy(scores, t_te)},
+           "by_bucket": {}, "tail": {}, "tail_only": tail_only, "use_neighbors": use_neighbors,
+           "n_train": int(train.sum()), "n_test": int(te.sum())}
     for bk in range(3):
         sel = bucket == bk
         if not sel.any():
@@ -228,21 +275,43 @@ def evaluate(data: dict, *, epochs: int = 300, seed: int = 0) -> dict:
             **baseline_summary(t_te[sel]),
             "selection": selection_accuracy(scores[sel], t_te[sel]),
         }
+    # left-for-talk aggregate (the number that matters): r0 > 1.
+    tail = bucket > 0
+    res["tail"] = {**baseline_summary(t_te[tail]),
+                   "selection": selection_accuracy(scores[tail], t_te[tail])}
     return res
+
+
+# variants compared in main(): (label, tail_only, use_neighbors)
+VARIANTS = (
+    ("static-all", False, False),     # the original Step-1 probe (R1-violating)
+    ("tail-only", True, False),       # fix 1(a)
+    ("tail+neigh", True, True),       # fix 1(a)+1(b)
+)
+
+
+def run_variants(data: dict, *, epochs: int = 300, seed: int = 0) -> dict:
+    return {label: evaluate(data, tail_only=to, use_neighbors=un, epochs=epochs, seed=seed)
+            for label, to, un in VARIANTS}
 
 
 # ---- report + plot ----------------------------------------------------------
 
 def format_report(per_k: dict) -> str:
-    lines = ["Step-1 selection-head probe (tuned-lens over iter-0 anchor, top-K restricted)"]
-    for k, res in per_k.items():
-        o = res["overall"]
-        lines.append(f"  K={k}: train/test positions={res['n_train']}/{res['n_test']}")
-        lines.append(f"    overall   argmax-copy={o['argmax_copy']:.1%}  "
-                     f"selection={o['selection']:.1%}  ceiling(c∈topK)={o['ceiling']:.1%}")
-        for name, r in res["by_bucket"].items():
-            lines.append(f"    {name:<14s} argmax-copy={r['argmax_copy']:.1%}  "
-                         f"selection={r['selection']:.1%}  ceiling={r['ceiling']:.1%}  (n={r['n']})")
+    """per_k[K][variant_label] = evaluate() result."""
+    lines = ["Step-1 selection-head probe (tuned-lens over iter-0 anchor, top-K restricted)",
+             "  variants: static-all (R1-violating) | tail-only (1a) | tail+neigh (1a+1b)"]
+    for k, variants in per_k.items():
+        any_res = next(iter(variants.values()))
+        lines.append(f"  K={k}: test positions={any_res['n_test']}  "
+                     f"tail ceiling(c∈topK)={any_res['tail']['ceiling']:.1%}")
+        for label, res in variants.items():
+            t = res["tail"]; med = res["by_bucket"].get(BUCKETS[1], {}); hard = res["by_bucket"].get(BUCKETS[2], {})
+            lines.append(
+                f"    {label:<11s} tail-selection={t['selection']:.1%}  "
+                f"(medium={med.get('selection', float('nan')):.1%}, "
+                f"hard={hard.get('selection', float('nan')):.1%})  "
+                f"[train n={res['n_train']}]")
     return "\n".join(lines)
 
 
@@ -250,23 +319,35 @@ def plot(per_k: dict, out_dir: Path, model: str) -> None:
     import matplotlib.pyplot as plt
     out_dir.mkdir(parents=True, exist_ok=True)
     ks = list(per_k.keys())
+    labels = [lbl for lbl, _, _ in VARIANTS]
+    colors = {"static-all": "tab:gray", "tail-only": "tab:orange", "tail+neigh": "tab:green"}
     fig, axes = plt.subplots(1, len(ks), figsize=(7.5 * len(ks), 4.8), squeeze=False)
     for j, k in enumerate(ks):
         ax = axes[0][j]
-        res = per_k[k]
-        names = ["overall"] + list(res["by_bucket"].keys())
-        xs = np.arange(len(names))
-        argmax = [res["overall"]["argmax_copy"]] + [res["by_bucket"][n]["argmax_copy"] for n in names[1:]]
-        sel = [res["overall"]["selection"]] + [res["by_bucket"][n]["selection"] for n in names[1:]]
-        ceil = [res["overall"]["ceiling"]] + [res["by_bucket"][n]["ceiling"] for n in names[1:]]
-        ax.bar(xs - 0.25, argmax, width=0.25, color="tab:gray", label="argmax-copy (floor)")
-        ax.bar(xs + 0.00, sel, width=0.25, color="tab:green", label="selection-head")
-        ax.bar(xs + 0.25, ceil, width=0.25, color="tab:purple", alpha=0.6, label="ceiling c∈topK")
-        ax.set_xticks(xs); ax.set_xticklabels(names, fontsize=8, rotation=15)
+        variants = per_k[k]
+        groups = ["medium(r≤10)", "hard(r>10)", "tail(r>1)"]
+        xs = np.arange(len(groups))
+        w = 0.8 / (len(labels) + 1)
+        for i, lbl in enumerate(labels):
+            res = variants[lbl]
+            vals = [res["by_bucket"].get(BUCKETS[1], {}).get("selection", np.nan),
+                    res["by_bucket"].get(BUCKETS[2], {}).get("selection", np.nan),
+                    res["tail"]["selection"]]
+            ax.bar(xs + (i - len(labels) / 2) * w, vals, width=w, color=colors[lbl], label=lbl)
+        # ceiling per group
+        any_res = next(iter(variants.values()))
+        ceil = [any_res["by_bucket"].get(BUCKETS[1], {}).get("ceiling", np.nan),
+                any_res["by_bucket"].get(BUCKETS[2], {}).get("ceiling", np.nan),
+                any_res["tail"]["ceiling"]]
+        ax.bar(xs + (len(labels) - len(labels) / 2) * w, ceil, width=w,
+               color="tab:purple", alpha=0.45, label="ceiling c∈topK")
+        ax.set_xticks(xs); ax.set_xticklabels(groups, fontsize=8)
         ax.set_ylim(0, 1); ax.set_ylabel("selection accuracy")
-        ax.set_title(f"K={k}: does the readout beat argmax-copy?")
+        ax.axhline(0.215, ls="--", lw=0.8, color="black")
+        ax.text(0.02, 0.225, "static-anchor floor ≈21% (R4)", fontsize=7, transform=ax.get_yaxis_transform())
+        ax.set_title(f"K={k}: does tail-only + neighbors lift the tail?")
         ax.legend(fontsize=8); ax.grid(alpha=0.3)
-    fig.suptitle(f"{model}: Step-1 selection-head extractability")
+    fig.suptitle(f"{model}: Step-1 selection-head extractability (variant comparison)")
     fig.tight_layout()
     p = out_dir / "selection_head.png"
     fig.savefig(p, dpi=130, bbox_inches="tight")
@@ -308,6 +389,26 @@ def _selftest() -> None:
     pid = np.array(["a"] * 300 + ["b"] * 300)
     tr, te = _prompt_split(pid)
     assert not (set(pid[tr]) & set(pid[te]))
+
+    # neighbor-conditioned (non-square) head: build a target that depends ONLY on
+    # a neighbor feature; the anchor block is pure noise. The [anchor;neigh] head
+    # (Dz=2D) must recover it, while an anchor-only head (Dz=D) cannot.
+    rng2 = np.random.default_rng(1)
+    Wn = rng2.standard_normal((V, D))
+    anchor = rng2.standard_normal((N, D))                  # uninformative
+    g = rng2.standard_normal((N, D))                       # informative neighbor feat
+    Ag = rng2.standard_normal((D, D)) * 0.5 + np.eye(D)
+    cids = np.stack([rng2.choice(V, size=K, replace=False) for _ in range(N)])
+    ce2 = Wn[cids]
+    tgt2 = np.einsum("nd,nkd->nk", g @ Ag, ce2).argmax(1)
+    feat2 = np.concatenate([anchor, g], axis=1)            # [N, 2D]
+    A2, b2 = fit_selection_head(feat2[:ntr], ce2[:ntr], tgt2[:ntr], epochs=600, lr=0.1, l2=1e-5)
+    assert A2.shape == (2 * D, D)
+    acc_n = selection_accuracy(head_scores(feat2[ntr:], ce2[ntr:], A2, b2), tgt2[ntr:])
+    A_anchor, b_anchor = fit_selection_head(anchor[:ntr], ce2[:ntr], tgt2[:ntr], epochs=600, lr=0.1, l2=1e-5)
+    acc_a = selection_accuracy(head_scores(anchor[ntr:], ce2[ntr:], A_anchor, b_anchor), tgt2[ntr:])
+    assert acc_n > 0.8, f"neighbor head should recover neighbor-driven target, got {acc_n:.2f}"
+    assert acc_n > acc_a + 0.3, f"neighbor ({acc_n:.2f}) must beat anchor-only ({acc_a:.2f})"
     print("plot_selection_head selftest OK")
 
 
@@ -333,7 +434,7 @@ def main() -> None:
     for k in args.K:
         data = compute_selection_inputs(args.probes_root, args.model, head, k,
                                         block_length=args.block_length, n_samples=args.n_samples)
-        per_k[k] = evaluate(data, epochs=args.epochs, seed=args.seed)
+        per_k[k] = run_variants(data, epochs=args.epochs, seed=args.seed)
     print(format_report(per_k))
     plot(per_k, Path(args.probes_root) / args.model / "plots", args.model)
 
