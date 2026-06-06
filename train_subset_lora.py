@@ -69,11 +69,29 @@ def split_samples(samples, n_train: int, n_val: int):
 
 # ---- LoRA model construction ------------------------------------------------
 
+def discover_linear_targets(model, *, exclude=("lm_head",)) -> list[str]:
+    """Leaf names of every nn.Linear in the model (e.g. q_proj, kv_proj, dense,
+    gate_proj, …), so we can pass an explicit LIST to PEFT. PEFT requires a list
+    (not the 'all-linear' string) whenever `layers_to_transform` is used."""
+    import torch.nn as nn
+    names = set()
+    for name, mod in model.named_modules():
+        if isinstance(mod, nn.Linear):
+            leaf = name.split(".")[-1]
+            if leaf and leaf not in exclude and not leaf.isdigit():
+                names.add(leaf)
+    return sorted(names)
+
+
 def make_lora_model(model, subset, *, rank: int, alpha: int, dropout: float,
                     target_modules, use_dora: bool, use_rslora: bool):
     """Wrap `model` with PEFT LoRA on ONLY the `subset` layers. Returns the
-    PeftModel. `target_modules` may be 'all-linear' or a list of name substrings."""
+    PeftModel. `target_modules='all-linear'` is auto-expanded to the discovered
+    Linear-leaf-name list (the string form is incompatible with layers_to_transform)."""
     from peft import LoraConfig, get_peft_model
+    if target_modules == "all-linear":
+        target_modules = discover_linear_targets(model)
+        print(f"[lora] auto-discovered Linear targets: {target_modules}")
     cfg = LoraConfig(
         r=rank, lora_alpha=alpha, lora_dropout=dropout,
         target_modules=target_modules,
@@ -235,7 +253,21 @@ def main() -> None:
           f"{compute_fraction(subset, depth):.0%} draft compute); "
           f"variant={'DoRA' if args.dora else ('rsLoRA' if args.rslora else 'LoRA')} r={args.rank}")
     try:
-        # 1) teacher targets + iter-1 inputs from the FULL model (no adapters yet)
+        # --dry_run only needs the targeting check, not the (slow) teacher precompute.
+        if args.dry_run:
+            model = make_lora_model(model, subset, rank=args.rank, alpha=args.alpha,
+                                    dropout=args.dropout, target_modules=targets,
+                                    use_dora=args.dora, use_rslora=args.rslora)
+            rep = adapted_layer_report(model)
+            print(f"[lora] adapted layers={rep['adapted_layers']}  "
+                  f"trainable={rep['trainable']:,} / {rep['total']:,} "
+                  f"({100*rep['trainable']/max(rep['total'],1):.3f}%)")
+            if set(rep["adapted_layers"]) != set(subset):
+                print(f"[lora] WARNING: adapted layers {rep['adapted_layers']} != subset {subset} "
+                      f"— check --lora_targets / layers_pattern.")
+            print("[lora] --dry_run: stopping before training.")
+            return
+        # 1) teacher targets + iter-1 inputs from the FULL model (adapters absent)
         samples = [tc.load_sample(p) for p in tc.iter_sample_paths(args.probes_root, args.model)]
         tr_s, va_s = split_samples(samples, args.n_train_samples, args.n_val_samples)
         train_blocks = precompute_blocks(model, tokenizer, tr_s, block_length=args.block_length,
@@ -254,9 +286,6 @@ def main() -> None:
         if set(rep["adapted_layers"]) != set(subset):
             print(f"[lora] WARNING: adapted layers {rep['adapted_layers']} != subset {subset} "
                   f"— check --lora_targets / layers_pattern.")
-        if args.dry_run:
-            print("[lora] --dry_run: stopping before training.")
-            return
         # 3) train
         train(model, subset, train_blocks, val_blocks, block_length=args.block_length,
               device=args.device, state=state, epochs=args.epochs, lr=args.lr,
