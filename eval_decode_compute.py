@@ -349,7 +349,8 @@ def main() -> None:
     ap.add_argument("--configs", nargs="+", default=["full", "L9M4", "L6M4", "L12M4"],
                     help="e.g. full L9M4 L6 L12M2  (L<cut>M<rethink>; no M ⇒ one think/block)")
     ap.add_argument("--n_problems", type=int, default=100)
-    ap.add_argument("--gen_length", type=int, default=256)
+    ap.add_argument("--gen_length", type=int, default=512,
+                    help="generated tokens; 256 truncates this model's verbose CoT — use >=512")
     ap.add_argument("--block_length", type=int, default=32)
     ap.add_argument("--gsm8k_n", type=int, default=0,
                     help="if >0, load this many GSM8K test problems via `datasets` "
