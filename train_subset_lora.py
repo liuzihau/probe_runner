@@ -140,13 +140,14 @@ def _block_logits(model, emb, blk, *, block_length, dtype, device, state, keep):
 
 
 def train(model, subset, train_blocks, val_blocks, *, block_length, device, state,
-          epochs: int, lr: float, batch_blocks: int, out_dir: str | None) -> dict:
+          epochs: int, lr: float, batch_blocks: int, out_dir: str | None,
+          weight_decay: float = 0.0, patience: int = 0) -> dict:
     import torch
     import torch.nn.functional as F
     emb = _embed(model)
     dtype = next(model.parameters()).dtype
     params = [p for p in model.parameters() if p.requires_grad]
-    opt = torch.optim.AdamW(params, lr=lr)
+    opt = torch.optim.AdamW(params, lr=lr, weight_decay=weight_decay)
     keep = tuple(subset)
     rng = np.random.default_rng(0)
     history = []
@@ -160,6 +161,7 @@ def train(model, subset, train_blocks, val_blocks, *, block_length, device, stat
 
     f0 = _val()
     print(f"[lora] val tail-fidelity before training (untrained subset floor): {f0:.1%}")
+    best_vf, best_ep, since = f0, 0, 0          # never save something worse than the floor
     for ep in range(1, epochs + 1):
         model.train()
         order = rng.permutation(len(train_blocks))
@@ -182,11 +184,24 @@ def train(model, subset, train_blocks, val_blocks, *, block_length, device, stat
         vf = _val()
         tr = loss_sum / max(n_steps, 1)
         history.append({"epoch": ep, "train_ce": tr, "val_fidelity": vf})
-        print(f"[lora] epoch {ep}: train_ce={tr:.3f}  val tail-fidelity={vf:.1%}")
-    if out_dir:
-        model.save_pretrained(out_dir)
-        print(f"[lora] saved adapter to {out_dir}")
-    return {"floor": f0, "history": history}
+        tag = ""
+        if vf > best_vf:                        # SAVE-BEST: only keep the best-val adapter
+            best_vf, best_ep, since = vf, ep, 0
+            if out_dir:
+                model.save_pretrained(out_dir); tag = "  ↑ new best (saved)"
+        else:
+            since += 1
+        print(f"[lora] epoch {ep}: train_ce={tr:.3f}  val tail-fidelity={vf:.1%}{tag}")
+        if patience and since >= patience:
+            print(f"[lora] early stop: no val improvement for {patience} epochs")
+            break
+    if best_ep == 0:
+        print(f"[lora] WARNING: no epoch beat the untrained floor {f0:.1%} — "
+              f"the draft is overfitting, not learning (nothing saved).")
+    else:
+        print(f"[lora] best val tail-fidelity={best_vf:.1%} at epoch {best_ep} "
+              f"(floor {f0:.1%}); adapter at {out_dir}")
+    return {"floor": f0, "best": best_vf, "best_epoch": best_ep, "history": history}
 
 
 # ---- selftest (torch-free helpers) ------------------------------------------
@@ -224,6 +239,8 @@ def main() -> None:
     ap.add_argument("--n_val_samples", type=int, default=20)
     ap.add_argument("--epochs", type=int, default=5)
     ap.add_argument("--lr", type=float, default=2e-4)
+    ap.add_argument("--weight_decay", type=float, default=0.0, help="AdamW weight decay (anti-overfit)")
+    ap.add_argument("--patience", type=int, default=0, help="early-stop after N epochs w/o val gain (0=off)")
     ap.add_argument("--batch_blocks", type=int, default=8)
     ap.add_argument("--block_length", type=int, default=32)
     ap.add_argument("--device", default="cuda")
@@ -289,7 +306,8 @@ def main() -> None:
         # 3) train
         train(model, subset, train_blocks, val_blocks, block_length=args.block_length,
               device=args.device, state=state, epochs=args.epochs, lr=args.lr,
-              batch_blocks=args.batch_blocks, out_dir=args.out_dir)
+              batch_blocks=args.batch_blocks, out_dir=args.out_dir,
+              weight_decay=args.weight_decay, patience=args.patience)
     finally:
         for h in handles:
             h.remove()

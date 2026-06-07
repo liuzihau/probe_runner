@@ -223,7 +223,8 @@ def load_problems_from_captures(probes_root, model: str):
 
 def run_eval(model_path: str, problems: list, config_labels: list, *,
              n_problems: int, gen_length: int = 256, block_length: int = 32,
-             t3dmax_root=None, device: str = "cuda") -> dict:
+             t3dmax_root=None, device: str = "cuda", eos_id_override=None,
+             debug_print: int = 0) -> dict:
     import torch
     from probe_runner.llada2_runner import load_llada2
 
@@ -232,17 +233,20 @@ def run_eval(model_path: str, problems: list, config_labels: list, *,
     layers = _decoder_layers(model)
     depth = len(layers)
     mask_id = tc.MASK_ID
-    eos_id = tokenizer.eos_token_id
+    eos_id = eos_id_override if eos_id_override is not None else tokenizer.eos_token_id
     cfgs = [parse_config(c) for c in config_labels]
+    print(f"[eval] eos_id={eos_id} (tokenizer.eos={tokenizer.eos_token_id}, mask_id={mask_id}); "
+          f"gen_length={gen_length} block_length={block_length}; depth={depth}")
 
     def _format(q):
         msg = [{"role": "user", "content": q}]
         p = tokenizer.apply_chat_template(msg, add_generation_prompt=True, tokenize=False)
         return tokenizer(p, return_tensors="pt")["input_ids"].to(device)
 
-    res = {lbl: {"correct": 0, "total": 0, "cost": 0.0, "nfe": 0, "cut": L, "rethink": M}
-           for lbl, L, M in cfgs}
+    res = {lbl: {"correct": 0, "total": 0, "cost": 0.0, "nfe": 0,
+                 "truncated": 0, "cut": L, "rethink": M} for lbl, L, M in cfgs}
     probs = problems[:n_problems]
+    printed = 0
     for q, gold in tc.progress_iter(probs, total=len(probs), desc="GSM8K eval"):
         prompt = _format(q)
         Lp = int(prompt.shape[1])
@@ -251,14 +255,23 @@ def run_eval(model_path: str, problems: list, config_labels: list, *,
                 model, layers, prompt, cut_layer=L, rethink_every=M, mask_id=mask_id,
                 eos_id=eos_id, gen_length=gen_length, block_length=block_length)
             gen = x[0, Lp:]
-            if eos_id is not None and (gen == eos_id).any():
+            hit_eos = eos_id is not None and bool((gen == eos_id).any())
+            if hit_eos:
                 gen = gen[: int(torch.where(gen == eos_id)[0][0])]
             text = tokenizer.decode(gen, skip_special_tokens=True)
+            ok = is_correct(text, gold)
             r = res[lbl]
-            r["correct"] += int(is_correct(text, gold))
-            r["total"] += 1
-            r["cost"] += cost
-            r["nfe"] += nfe
+            r["correct"] += int(ok); r["total"] += 1
+            r["cost"] += cost; r["nfe"] += nfe
+            r["truncated"] += int(not hit_eos)        # never emitted EOS = likely truncated
+            if debug_print and printed < debug_print and lbl == cfgs[0][0]:
+                printed += 1
+                n_mask = int((x[0, Lp:] == mask_id).sum())   # positions never decoded
+                print(f"\n========== debug ex {printed} [{lbl}] ==========")
+                print(f"gold={gold_number(gold)}  pred={_last_number(text)}  "
+                      f"{'CORRECT' if ok else 'WRONG'}  hit_eos={hit_eos}  "
+                      f"undecoded_masks={n_mask}  gen_tokens={int((x[0,Lp:]!=mask_id).sum())}")
+                print(f"GEN TEXT: {text[:600]!r}")
     return {"depth": depth, "per_config": res}
 
 
@@ -270,9 +283,11 @@ def format_report(out: dict) -> str:
         acc = r["correct"] / max(r["total"], 1)
         mc = r["cost"] / max(r["total"], 1)
         rel = f"  ({mc / base_cost:.0%} of full)" if base_cost else ""
+        trunc = r.get("truncated", 0)
         lines.append(f"  {lbl:<8s} cut=L{r['cut']} rethink={r['rethink'] if r['rethink']<10**8 else '∞'}  "
                      f"acc={acc:.1%} ({r['correct']}/{r['total']})  "
-                     f"mean-cost={mc:.2f} think-pass-equiv{rel}")
+                     f"mean-cost={mc:.2f} think-pass-equiv{rel}  "
+                     f"no-EOS={trunc}/{r['total']}")
     return "\n".join(lines)
 
 
@@ -340,6 +355,11 @@ def main() -> None:
                     help="if >0, load this many GSM8K test problems via `datasets` "
                          "instead of reading prompts from the captures.")
     ap.add_argument("--device", default="cuda")
+    ap.add_argument("--eos_id", type=int, default=None,
+                    help="override EOS id (LLaDA-2.0 family is 156892; use if tokenizer.eos is wrong)")
+    ap.add_argument("--debug_print", type=int, default=0,
+                    help="dump the first N decoded outputs (text, pred, gold, eos/mask flags) "
+                         "for the first config — to localize a low baseline")
     ap.add_argument("--selftest", action="store_true")
     args = ap.parse_args()
     if args.selftest:
@@ -358,7 +378,8 @@ def main() -> None:
                              f"use --gsm8k_n N instead.")
     out = run_eval(args.model_path, problems, args.configs, n_problems=args.n_problems,
                    gen_length=args.gen_length, block_length=args.block_length,
-                   t3dmax_root=args.t3dmax_root, device=args.device)
+                   t3dmax_root=args.t3dmax_root, device=args.device,
+                   eos_id_override=args.eos_id, debug_print=args.debug_print)
     print(format_report(out))
     plot(out, Path(args.probes_root) / args.model / "plots", args.model)
 
