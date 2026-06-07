@@ -131,6 +131,28 @@ python -m probe_runner.train_subset_lora --model llada2 \
     --model_path /path/to/DMax-Math-16B --subset 1,3,13,15 --rank 16 --rslora \
     --n_train_samples 80 --n_val_samples 20 --epochs 8 --out_dir lora_1_3_13_15
 
+# Layer-merge compression: keep the load-bearing anchors CLEAN/frozen (--keep, the
+#   importance-map layers 0-5, 12, 19), collapse each redundant gap (6-11, 13-18)
+#   into trainable layer(s), full-FT to match the full model's iter-1 tail, then
+#   GSM8K accuracy-vs-compute. Plan from --keep 0-5,12,19 (n_merged_per_block=1):
+#     [0..5] merge(6-11) [12] merge(13-18) [19]  = 10 layers (50% compute).
+#   --init representative = copy each gap's midpoint layer (coherent, MoE-safe);
+#   --init average = elementwise weight-average of the gap (blends MoE experts,
+#   relies on full-FT). Tighten by widening gaps (--keep 0-3,12,19) or shrinking
+#   the budget; loosen with --n_merged_per_block 2. --dry_run prints the plan +
+#   trainable params + a forward sanity check before training.
+python -m probe_runner.merge_layers --model llada2 \
+    --model_path /path/to/DMax-Math-16B --keep 0-5,12,19 --n_merged_per_block 1 \
+    --init representative --dry_run
+python -m probe_runner.merge_layers --model llada2 \
+    --model_path /path/to/DMax-Math-16B --keep 0-5,12,19 --n_merged_per_block 1 \
+    --init representative --n_train_samples 80 --n_val_samples 20 --epochs 8 --lr 1e-4 \
+    --patience 3 --eval_gsm8k 100 --gen_length 512 --out_dir merged_k1
+# weight-averaging init variant (merge-then-heal):
+python -m probe_runner.merge_layers --model llada2 \
+    --model_path /path/to/DMax-Math-16B --keep 0-5,12,19 --n_merged_per_block 1 \
+    --init average --epochs 8 --lr 1e-4 --eval_gsm8k 100 --out_dir merged_k1_avg
+
 # ---- C. End-to-end GSM8K accuracy vs compute (the decisive H1 test) ---------
 # Decode under a refresh policy and score real GSM8K accuracy. Config grammar:
 #   full = DMax baseline; L<cut>M<rethink> = reuse cached layers <cut, recompute
@@ -151,9 +173,12 @@ python -m probe_runner.eval_decode_compute --model llada2 \
 > per readiness bucket. selection_head/attn → tail selection accuracy vs the
 > argmax-copy floor and the top-K ceiling. eval_layer_subset → ranked keep-subsets
 > + layer-importance vs a contiguous-top baseline. train_subset_lora → per-epoch
-> val tail-fidelity (does LoRA lift the floor?). eval_decode_compute → per-config
-> `acc`, `mean-cost` (FLOP-equiv), `no-EOS` (truncations), `distinct4` (prose
-> repetition) and `sim_full` (text similarity to the full decode).
+> val tail-fidelity (does LoRA lift the floor?). merge_layers → the compressed-stack
+> plan, per-epoch val tail-fidelity, and (with `--eval_gsm8k`) GSM8K accuracy +
+> effective compute (`new_depth/full_depth` × passes) vs the full baseline.
+> eval_decode_compute → per-config `acc`, `mean-cost` (FLOP-equiv), `no-EOS`
+> (truncations), `distinct4` (prose repetition) and `sim_full` (text similarity to
+> the full decode).
 
 > **Cost is FLOP-equivalent, not latency.** The decode harness runs full forwards
 > + hooks (it does not actually skip the low-layer compute), so `mean-cost` is a
