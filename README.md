@@ -89,6 +89,78 @@ covered by a synthetic regression test:
 python -m probe_runner.tests.test_trajectory_analyses
 ```
 
+**3. Extraction → re-ranking → decode experiments (T3-D campaign).** Built to
+answer, in order: *is the hard tail's answer present (yes), is it load-bearing or
+filler (filler), can a cheap model extract it (no), and does a cheaper decode hold
+GSM8K accuracy (yes, ~25–30% fewer FLOPs at parity).* All re-use the same captures
++ `lm_head.pt`. `--model` is the `probes_out/<name>/` subdir (e.g. `llada2-DMAX`);
+every tool has a torch-free `--selftest` for its pure cores.
+
+```bash
+# ---- A. Is the answer present, correctness-safe, and extractable? -----------
+# Step 0 — miss-type audit: is the un-reachable (rank>K) tail load-bearing
+#   (digits/operators) or filler? Offline; needs the tokenizer to type tokens.
+python -m probe_runner.plots.plot_miss_types --model llada2 \
+    --probes_root probes_out --tokenizer /path/to/DMax-Math-16B
+
+# Step 1 — selection head: can a light tuned-lens readout SELECT the converged
+#   token from think's iter-0 top-K? Offline (head + captures, no model forward).
+#   Variants: static-all / tail-only (R1) / tail+neighbor (R2).
+python -m probe_runner.plots.plot_selection_head --model llada2 --K 10 100
+
+# Attention selection head over INDIVIDUAL revealed neighbors (self-masked,
+#   positional). Needs torch/GPU. --no_neighbors = ablation (null + anchor only).
+python -m probe_runner.plots.plot_selection_attn --model llada2 --K 10 100 --device cuda
+python -m probe_runner.plots.plot_selection_attn --model llada2 --K 10 100 --no_neighbors
+
+# ---- B. Draft & Verify: which layers can a cheap draft keep? ----------------
+# Layer-subset search: skip non-kept layers (identity), find the best k-layer
+#   subset by fidelity to the full iter-1 tail prediction. Modes:
+#   exhaustive (default) | --greedy | --restarts N (random-restart hill-climb).
+#   --no_force_first_last frees all k; --extra k chooses k (+forced first/last).
+python -m probe_runner.eval_layer_subset --model llada2 \
+    --model_path /path/to/DMax-Math-16B --extra 4 --no_force_first_last \
+    --restarts 8 --n_samples 50
+
+# Stage-2 LoRA: finetune adapters on ONLY the kept layers (PEFT; --dora/--rslora)
+#   to lift the untrained draft floor. --dry_run verifies targeting first.
+#   Saves best-val adapter; --patience / --weight_decay fight overfit.
+python -m probe_runner.train_subset_lora --model llada2 \
+    --model_path /path/to/DMax-Math-16B --subset 1,3,13,15 --dry_run
+python -m probe_runner.train_subset_lora --model llada2 \
+    --model_path /path/to/DMax-Math-16B --subset 1,3,13,15 --rank 16 --rslora \
+    --n_train_samples 80 --n_val_samples 20 --epochs 8 --out_dir lora_1_3_13_15
+
+# ---- C. End-to-end GSM8K accuracy vs compute (the decisive H1 test) ---------
+# Decode under a refresh policy and score real GSM8K accuracy. Config grammar:
+#   full = DMax baseline; L<cut>M<rethink> = reuse cached layers <cut, recompute
+#   cut..top, full re-think every <rethink> iters; L<cut> = one think per block.
+#   mean-cost is FLOP-equivalent (think pass=1.0, talk=(depth-cut)/depth), NOT
+#   wall-clock. Use --eos_id 156892 and --gen_length >=512 (256 truncates CoT).
+python -m probe_runner.eval_decode_compute --model llada2 \
+    --model_path /path/to/DMax-Math-16B \
+    --configs full L12M4 L9M4 L6M4 L9 --n_problems 300 \
+    --eos_id 156892 --gen_length 768
+# Localize a low baseline: dump decoded text / pred / gold / EOS+mask flags.
+python -m probe_runner.eval_decode_compute --model llada2 \
+    --model_path /path/to/DMax-Math-16B --configs full --n_problems 8 \
+    --eos_id 156892 --gen_length 512 --debug_print 8
+```
+
+> **What each reports.** miss_types → class-conditional miss-rate + token-type mix
+> per readiness bucket. selection_head/attn → tail selection accuracy vs the
+> argmax-copy floor and the top-K ceiling. eval_layer_subset → ranked keep-subsets
+> + layer-importance vs a contiguous-top baseline. train_subset_lora → per-epoch
+> val tail-fidelity (does LoRA lift the floor?). eval_decode_compute → per-config
+> `acc`, `mean-cost` (FLOP-equiv), `no-EOS` (truncations), `distinct4` (prose
+> repetition) and `sim_full` (text similarity to the full decode).
+
+> **Cost is FLOP-equivalent, not latency.** The decode harness runs full forwards
+> + hooks (it does not actually skip the low-layer compute), so `mean-cost` is a
+> projected work estimate — a *necessary* proxy that the scheme does less
+> arithmetic at parity, *not* a wall-clock speedup. A real speed claim needs the
+> optimized / vllm path; see `T3D_full_writeup.tex` §Threats.
+
 ---
 
 ## What it produces

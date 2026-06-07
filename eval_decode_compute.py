@@ -37,6 +37,7 @@ Usage
 from __future__ import annotations
 
 import argparse
+import difflib
 import re
 from pathlib import Path
 
@@ -77,6 +78,28 @@ def is_correct(pred_text: str, gold_answer: str, tol: float = 1e-4) -> bool:
     if p is None or g is None:
         return False
     return abs(p - g) <= tol * max(1.0, abs(g))
+
+
+# ---- text-quality metrics (pure, unit-testable) -----------------------------
+# Answer-match alone can't see prose degradation (repeated words, dropped tokens,
+# broken grammar) that a cheaper decode may introduce while still landing the right
+# number. These quantify it: distinct-n (lower = more repetition) and similarity to
+# the full decode's text (lower = the cheap path's prose diverged from the reference).
+
+def distinct_n(text: str, n: int = 4) -> float:
+    """Fraction of distinct n-grams (1.0 = no repetition, →0 = highly repetitive)."""
+    toks = text.split()
+    if len(toks) < n:
+        return 1.0
+    grams = [tuple(toks[i:i + n]) for i in range(len(toks) - n + 1)]
+    return len(set(grams)) / len(grams)
+
+
+def text_similarity(a: str, b: str) -> float:
+    """Word-level similarity in [0,1] (difflib ratio); 1.0 = identical text."""
+    if not a and not b:
+        return 1.0
+    return difflib.SequenceMatcher(None, a.split(), b.split()).ratio()
 
 
 # ---- compute accounting (pure, unit-testable) -------------------------------
@@ -243,13 +266,14 @@ def run_eval(model_path: str, problems: list, config_labels: list, *,
         p = tokenizer.apply_chat_template(msg, add_generation_prompt=True, tokenize=False)
         return tokenizer(p, return_tensors="pt")["input_ids"].to(device)
 
-    res = {lbl: {"correct": 0, "total": 0, "cost": 0.0, "nfe": 0,
-                 "truncated": 0, "cut": L, "rethink": M} for lbl, L, M in cfgs}
+    res = {lbl: {"correct": 0, "total": 0, "cost": 0.0, "nfe": 0, "truncated": 0,
+                 "distinct4": 0.0, "sim_full": 0.0, "cut": L, "rethink": M} for lbl, L, M in cfgs}
     probs = problems[:n_problems]
     printed = 0
     for q, gold in tc.progress_iter(probs, total=len(probs), desc="GSM8K eval"):
         prompt = _format(q)
         Lp = int(prompt.shape[1])
+        texts = {}                                    # per-config decoded text, for similarity-to-full
         for lbl, L, M in cfgs:
             x, cost, nfe = decode_with_refresh(
                 model, layers, prompt, cut_layer=L, rethink_every=M, mask_id=mask_id,
@@ -259,11 +283,13 @@ def run_eval(model_path: str, problems: list, config_labels: list, *,
             if hit_eos:
                 gen = gen[: int(torch.where(gen == eos_id)[0][0])]
             text = tokenizer.decode(gen, skip_special_tokens=True)
+            texts[lbl] = text
             ok = is_correct(text, gold)
             r = res[lbl]
             r["correct"] += int(ok); r["total"] += 1
             r["cost"] += cost; r["nfe"] += nfe
             r["truncated"] += int(not hit_eos)        # never emitted EOS = likely truncated
+            r["distinct4"] += distinct_n(text, 4)     # prose repetition (1=clean, low=repetitive)
             if debug_print and printed < debug_print and lbl == cfgs[0][0]:
                 printed += 1
                 n_mask = int((x[0, Lp:] == mask_id).sum())   # positions never decoded
@@ -272,6 +298,10 @@ def run_eval(model_path: str, problems: list, config_labels: list, *,
                       f"{'CORRECT' if ok else 'WRONG'}  hit_eos={hit_eos}  "
                       f"undecoded_masks={n_mask}  gen_tokens={int((x[0,Lp:]!=mask_id).sum())}")
                 print(f"GEN TEXT: {text[:600]!r}")
+        # prose divergence from the FULL decode (the reference we're trying to match)
+        if "full" in texts:
+            for lbl in texts:
+                res[lbl]["sim_full"] += text_similarity(texts[lbl], texts["full"])
     return {"depth": depth, "per_config": res}
 
 
@@ -284,10 +314,13 @@ def format_report(out: dict) -> str:
         mc = r["cost"] / max(r["total"], 1)
         rel = f"  ({mc / base_cost:.0%} of full)" if base_cost else ""
         trunc = r.get("truncated", 0)
+        n = max(r["total"], 1)
+        d4 = r.get("distinct4", 0.0) / n              # prose repetition (1=clean)
+        simf = r.get("sim_full", 0.0) / n             # word-similarity to full decode
         lines.append(f"  {lbl:<8s} cut=L{r['cut']} rethink={r['rethink'] if r['rethink']<10**8 else '∞'}  "
                      f"acc={acc:.1%} ({r['correct']}/{r['total']})  "
                      f"mean-cost={mc:.2f} think-pass-equiv{rel}  "
-                     f"no-EOS={trunc}/{r['total']}")
+                     f"no-EOS={trunc}/{r['total']}  distinct4={d4:.2f}  sim_full={simf:.2f}")
     return "\n".join(lines)
 
 
@@ -327,6 +360,14 @@ def _selftest() -> None:
     assert is_correct("answer: 1,000", "#### 1000")
     assert not is_correct("we get 41", "#### 42")
     assert not is_correct("no number", "#### 42")
+    # text-quality metrics
+    assert distinct_n("a b c d e f g h", 4) == 1.0          # all 4-grams distinct
+    assert distinct_n("a b c d a b c d", 4) == 0.8          # last 4-gram repeats first → 4/5
+    assert distinct_n("x x x x x", 2) < 0.5                  # "x x" repeated → low distinct
+    assert distinct_n("only three words", 4) == 1.0          # < n tokens → 1.0
+    assert text_similarity("the cat sat", "the cat sat") == 1.0
+    assert text_similarity("the cat sat", "the dog ran") < 1.0
+    assert 0.0 <= text_similarity("a b c d", "a b x d") <= 1.0
     # compute accounting
     assert pass_cost(True, 9, 20) == 1.0
     assert pass_cost(False, 10, 20) == 0.5
