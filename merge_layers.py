@@ -357,6 +357,11 @@ def main() -> None:
     ap.add_argument("--gen_length", type=int, default=512)
     ap.add_argument("--eos_id", type=int, default=156892)
     ap.add_argument("--out_dir", default=None)
+    ap.add_argument("--save_hf", default=None,
+                    help="save the compressed model as a standalone HF checkpoint (config "
+                         "num_hidden_layers=new_depth) that your OPUT trainer can load + "
+                         "rollout-finetune. Works with --dry_run to export the UNTRAINED 10-layer "
+                         "model for on-policy training (the recommended path).")
     ap.add_argument("--dry_run", action="store_true", help="build compressed model + test a forward, then stop")
     ap.add_argument("--selftest", action="store_true")
     args = ap.parse_args()
@@ -395,6 +400,10 @@ def main() -> None:
             print(f"[merge] FORWARD FAILED after surgery: {type(e).__name__}: {e}\n"
                   f"        the model's forward may assume a fixed layer count / layer_idx; "
                   f"inspect LLaDA2MoeModel.forward.")
+        if args.save_hf:
+            model.save_pretrained(args.save_hf); tokenizer.save_pretrained(args.save_hf)
+            print(f"[merge] saved standalone {new_depth}-layer HF checkpoint to {args.save_hf} "
+                  f"(untrained — feed to OPUT rollout training).")
         return
 
     # teacher targets from the FULL model (before surgery), prompt-disjoint
@@ -437,6 +446,12 @@ def main() -> None:
               f"mean-passes={ev['mean_passes']:.1f}  eff-compute={ev['eff_compute_passes']:.1f} "
               f"full-pass-equiv  no-EOS={ev['no_eos']}/{ev['n']}")
         print(f"[merge] compare vs full (84% @ 100% layers, ~49 cost in the gen512 sweep).")
+
+    if args.save_hf:
+        model.save_pretrained(args.save_hf); tokenizer.save_pretrained(args.save_hf)
+        print(f"[merge] saved {new_depth}-layer HF checkpoint to {args.save_hf} "
+              f"(post-CE-warmup; for the best-val state use --patience, or save UNTRAINED via "
+              f"--dry_run --save_hf and let OPUT do the real training).")
 
 
 if __name__ == "__main__":
