@@ -197,8 +197,12 @@ def oracle_neighbor_conf(model, x_final, Lp, *, block_length, targets, mask_id, 
                     ap = Lp + g                                # absolute seq position
                     abs_pos.append(ap)
                     ids[k, ap] = mask_id
-                out = model(inputs_embeds=emb(ids), attention_mask=attn,
-                            position_ids=pos, use_cache=False,
+                # this model asserts the attn mask / position_ids batch-match the inputs
+                # (no broadcast over batch), so expand both to the chunk size.
+                bs = len(chunk)
+                out = model(inputs_embeds=emb(ids),
+                            attention_mask=attn.expand(bs, -1, -1, -1),
+                            position_ids=pos.expand(bs, -1), use_cache=False,
                             output_hidden_states=False, return_dict=True)
                 for k, g in enumerate(chunk):
                     lg = out.logits[k, abs_pos[k], :].float()
