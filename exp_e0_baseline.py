@@ -79,7 +79,8 @@ def run(args) -> None:
         for lbl, L, M in cfgs:
             x, cost, nfe = decode_with_refresh(
                 model, layers, prompt, cut_layer=L, rethink_every=M, mask_id=mask_id,
-                eos_id=eos_id, gen_length=args.gen_length, block_length=args.block_length)
+                eos_id=eos_id, gen_length=args.gen_length, block_length=args.block_length,
+                commit_threshold=args.commit_threshold, break_threshold=args.break_threshold)
             gen = x[0, Lp:]
             hit_eos = bool((gen == eos_id).any())
             if hit_eos:
@@ -145,6 +146,10 @@ def main() -> None:
     ap.add_argument("--gsm8k_n", type=int, default=200)
     ap.add_argument("--gen_length", type=int, default=512)
     ap.add_argument("--block_length", type=int, default=32)
+    ap.add_argument("--commit_threshold", type=float, default=0.3,
+                    help="DMax soft decode commit threshold (0.3=aggressive default; try 0.5/0.6 for quality)")
+    ap.add_argument("--break_threshold", type=float, default=0.9,
+                    help="DMax soft decode per-block stop threshold")
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--eos_id", type=int, default=None)
     ap.add_argument("--out_dir", default="fork_bounded_surrogate/results/E0")

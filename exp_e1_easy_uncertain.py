@@ -250,7 +250,8 @@ def run(args) -> None:
         Lp = int(prompt.shape[1])
         x, reveal_pass, pass0_conf, pass0_ent, block_id = decode_and_record(
             model, prompt, mask_id=mask_id, eos_id=eos_id,
-            gen_length=args.gen_length, block_length=args.block_length)
+            gen_length=args.gen_length, block_length=args.block_length,
+            commit_threshold=args.commit_threshold, break_threshold=args.break_threshold)
 
         # truncate the accounting at EOS: positions after the first EOS are padding, not work
         gen = x[0, Lp:]
@@ -385,6 +386,10 @@ def main() -> None:
     ap.add_argument("--block_length", type=int, default=32)
     ap.add_argument("--hi", type=float, default=0.9,
                     help="oracle-neighbor confidence above which a position is 'easy-given-neighbors'")
+    ap.add_argument("--commit_threshold", type=float, default=0.3,
+                    help="DMax soft decode commit threshold (0.3=aggressive default; try 0.5/0.6 for quality)")
+    ap.add_argument("--break_threshold", type=float, default=0.9,
+                    help="DMax soft decode per-block stop threshold")
     ap.add_argument("--loo_batch", type=int, default=8, help="leave-one-out probe batch size")
     ap.add_argument("--gate_easy_frac", type=float, default=0.25)
     ap.add_argument("--gate_overlap", type=float, default=0.5)
