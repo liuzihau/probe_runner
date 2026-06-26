@@ -107,7 +107,7 @@ def decode_b2(model, prompt, *, mode, mask_id, eos_id, gen_length, block_length,
                 draft_tok = None
                 if mode != "none":
                     if mode == "oracle":
-                        draft_tok = oracle_final[s:e].to(device)
+                        draft_tok = oracle_final[s - Lp:e - Lp].to(device)   # oracle_final is gen-relative
                         draft_conf = torch.where(masked, torch.ones(block_length, device=device),
                                                  torch.zeros(block_length, device=device))
                     else:  # trunc
