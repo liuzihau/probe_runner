@@ -201,34 +201,44 @@ class DraftModel(nn.Module):
 
 
 # ---------------------------------------------------------------- toy data (learnable synthetic task)
-def make_toy_batch(cfg: DraftConfig, B, C, P, device, embed_weight, noise=0.6):
-    """The heavy signals all carry the true tokens (noisily); the drafter must fuse them, output Δh so
-    h_last+Δh ≈ E(true), and the FROZEN tied lm_head then decodes correctly. Confidence label = argmax==true."""
-    V, d = cfg.vocab_size, cfg.hidden_size
-    y = torch.randint(0, V, (B, C), device=device)                       # true denoise tokens
-    Ey = F.embedding(y, embed_weight)                                    # [B,C,d]
+def make_toy_batch(cfg: DraftConfig, B, C, P, device, embed_weight, noise=0.6,
+                   hard_frac=0.3, hard_noise=1.5):
+    """A controllable task. A `hard_frac` of DENOISE positions carry NO usable signal (pure noise) — the
+    drafter can't recover them (→ wrong → negatives), while their inputs are statistically distinguishable,
+    so the confidence head can learn to flag them. The rest carry the true token (noisily) and are recoverable.
+    Confidence label = (drafter argmax == true). draft_acc ≈ 1 − hard_frac; a good conf head ⇒ conf_auc ≫ 0.5."""
+    V = cfg.vocab_size
+    y = torch.randint(0, V, (B, C), device=device)
+    Ey = F.embedding(y, embed_weight)
+    hard = (torch.rand(B, C, device=device) < hard_frac)
+    easy = (~hard).float().unsqueeze(-1)                                 # [B,C,1]
     def nz(t, s): return t + s * torch.randn_like(t)
-    H_sel_denoise = torch.cat([nz(Ey, noise * (1 + j)) for j in range(cfg.m)], dim=-1)  # [B,C,m*d]
-    heavy_logits = nz(Ey, noise) @ embed_weight.t()                      # [B,C,V] (soft-embed recovers ~Ey)
-    h_last_denoise = nz(Ey, 1.2)                                         # corrupted base for Δh
-    o_denoise = torch.full((B, C), cfg.mask_token_id, device=device)     # canvas = masks
-    yp = torch.randint(0, V, (B, P), device=device)                      # prefix (context) tokens
+    def sig(view_noise):                                                 # easy: y+noise ; hard: pure junk
+        return easy * nz(Ey, view_noise) + (1 - easy) * (hard_noise * torch.randn_like(Ey))
+    H_sel_denoise = torch.cat([sig(noise * (1 + j)) for j in range(cfg.m)], dim=-1)
+    hl = easy * (nz(Ey, noise) @ embed_weight.t()) \
+         + (1 - easy) * ((hard_noise * torch.randn_like(Ey)) @ embed_weight.t())   # easy peaked / hard ~flat
+    h_last_denoise = sig(1.2)
+    o_denoise = torch.full((B, C), cfg.mask_token_id, device=device)
+    yp = torch.randint(0, V, (B, P), device=device)                     # prefix context = clean (committed)
     Eyp = F.embedding(yp, embed_weight)
     H_sel_prefix = torch.cat([nz(Eyp, noise * (1 + j)) for j in range(cfg.m)], dim=-1)
-    return dict(o_denoise=o_denoise, heavy_logits=heavy_logits, H_sel_denoise=H_sel_denoise,
+    return dict(o_denoise=o_denoise, heavy_logits=hl, H_sel_denoise=H_sel_denoise,
                 H_sel_prefix=H_sel_prefix, h_last_denoise=h_last_denoise), y
 
 
-def toy_train(cfg: DraftConfig, steps=400, B=16, C=16, P=24, lr=3e-3, device="cpu", w_pos=1.0, w_neg=3.0):
+def toy_train(cfg: DraftConfig, steps=400, B=16, C=16, P=24, lr=3e-3, device="cpu", w_pos=1.0, w_neg=3.0,
+              hard_frac=0.3, noise=0.6):
     torch.manual_seed(0)
     model = DraftModel(cfg).to(device)
     # tie lm_head to embedding (so the synthetic task is well-posed), both frozen
     with torch.no_grad():
         model.lm_head.weight.copy_(model.embed.weight)
     opt = torch.optim.Adam([p for p in model.parameters() if p.requires_grad], lr=lr)
-    print(f"[toy] trainable params={model.num_trainable():,}  device={device}")
+    print(f"[toy] trainable params={model.num_trainable():,}  device={device}  hard_frac={hard_frac}")
     for step in range(steps):
-        batch, y = make_toy_batch(cfg, B, C, P, device, model.embed.weight)
+        batch, y = make_toy_batch(cfg, B, C, P, device, model.embed.weight,
+                                  noise=noise, hard_frac=hard_frac)
         out = model(**batch)
         L_tok = F.cross_entropy(out["logits"].reshape(-1, cfg.vocab_size), y.reshape(-1))
         L_delta = 1e-3 * out["delta"].pow(2).mean()
@@ -288,13 +298,16 @@ def main():
     ap.add_argument("--hidden", type=int, default=128)
     ap.add_argument("--layers", type=int, default=5)
     ap.add_argument("--shared_fuse", action="store_true", help="use one shared prefix fuse (DFlash) instead of per-layer (D3)")
+    ap.add_argument("--hard_frac", type=float, default=0.3, help="fraction of denoise positions with no usable signal (creates negatives for the conf head)")
+    ap.add_argument("--noise", type=float, default=0.6)
     args = ap.parse_args()
     if args.selftest:
         _selftest(); return
     if args.toy_train:
         cfg = DraftConfig(hidden_size=args.hidden, n_layers=args.layers,
                           per_layer_prefix_fuse=not args.shared_fuse)
-        toy_train(cfg, steps=args.steps, device=args.device)
+        toy_train(cfg, steps=args.steps, device=args.device,
+                  hard_frac=args.hard_frac, noise=args.noise)
         return
     ap.print_help()
 
